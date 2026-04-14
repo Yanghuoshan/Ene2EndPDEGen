@@ -119,3 +119,180 @@ class TrajectoryChunkDataset(IterableDataset):
                 
                 # Yield: coords -> [N, 2], chunk -> [T, N, C]
                 yield self.coords, torch.tensor(chunk, dtype=torch.float32)
+
+import os
+import glob
+import h5py
+
+class H5DirectoryChunkDataset(IterableDataset):
+    """
+    Reads h5 files (1.h5, 2.h5, ...) from a directory.
+    Each h5 file is treated as one full trajectory and chunked along its time axis.
+    """
+    def __init__(
+        self,
+        dataset_path: str,
+        chunk_size: int = 16,
+        stride: int = None,
+        mode: str = "train",
+        seed: int = 42,
+        return_mesh_info: bool = False,
+    ):
+        super().__init__()
+        self.dataset_path = dataset_path
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+        self.chunk_size = chunk_size
+        self.stride = stride if stride is not None else chunk_size // 2
+        if self.stride <= 0:
+            raise ValueError(f"stride must be > 0, got {self.stride}")
+        self.mode = mode
+        self.seed = seed
+        self.is_train = mode == "train"
+        self.return_mesh_info = return_mesh_info
+        # Keep this True for compatibility with compute_dataset_statistics in normalize.py.
+        self.use_vo = True
+
+        # List all h5 files in the directory
+        self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.h5"))
+        # Sort by integer filename
+        try:
+            self.file_paths.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+        except ValueError:
+            self.file_paths.sort()
+        self.num_sims = len(self.file_paths)
+
+        if self.num_sims == 0:
+            raise ValueError(f"No h5 files found in {self.dataset_path}")
+
+        # Load per-file coords. Some datasets have different meshes per trajectory.
+        self.coords_per_sim = []
+        for file_path in self.file_paths:
+            with h5py.File(file_path, 'r') as f:
+                coords = np.array(f['mesh_pos'], dtype=np.float32)
+                if coords.ndim == 3 and coords.shape[-1] == 2:
+                    # mesh_pos may be stored as [T, N, 2] even when mesh is time-invariant.
+                    coords = coords[0]
+                if coords.ndim != 2 or coords.shape[-1] != 2:
+                    raise ValueError(
+                        f"mesh_pos must have shape [N, 2] or [T, N, 2], got {coords.shape} in {file_path}"
+                    )
+                self.coords_per_sim.append(torch.tensor(coords, dtype=torch.float32))
+
+        # Keep legacy attribute used by normalize.py; concat gives global coord stats.
+        self.coords = torch.cat(self.coords_per_sim, dim=0)
+
+        with h5py.File(self.file_paths[0], 'r') as f:
+            u0, v0, p0 = self._extract_uvp(f)
+            self.traj_len = int(u0.shape[0])
+
+        # Explicit legacy-compatible attributes for normalize.py
+        self.sim_indices = list(range(self.num_sims))
+        self.num_sims = len(self.sim_indices)
+        
+        self.epoch = 0
+
+    def _extract_uvp(self, h5_file):
+        velocity = np.array(h5_file['velocity'], dtype=np.float32)
+        pressure = np.array(h5_file['pressure'], dtype=np.float32)
+
+        if velocity.ndim == 2 and velocity.shape[-1] == 2:
+            velocity = velocity[None, ...]
+        if velocity.ndim != 3 or velocity.shape[-1] != 2:
+            raise ValueError(f"velocity must have shape [T, N, 2] or [N, 2], got {velocity.shape}")
+
+        if pressure.ndim == 1:
+            pressure = pressure[None, :]
+        elif pressure.ndim == 3 and pressure.shape[-1] == 1:
+            pressure = pressure[..., 0]
+        elif pressure.ndim == 2:
+            pass
+        else:
+            raise ValueError(f"pressure must have shape [T, N], [T, N, 1], [N] or [N, 1], got {pressure.shape}")
+
+        if pressure.shape[0] != velocity.shape[0]:
+            if pressure.shape[0] == 1 and velocity.shape[0] > 1:
+                pressure = np.repeat(pressure, velocity.shape[0], axis=0)
+            else:
+                raise ValueError(
+                    f"time length mismatch between velocity and pressure: "
+                    f"{velocity.shape[0]} vs {pressure.shape[0]}"
+                )
+
+        if pressure.shape[1] != velocity.shape[1]:
+            raise ValueError(
+                f"node count mismatch between velocity and pressure: "
+                f"{velocity.shape[1]} vs {pressure.shape[1]}"
+            )
+
+        u = velocity[..., 0]
+        v = velocity[..., 1]
+        p = pressure
+        return u, v, p
+
+    def _load_sim_data(self, sim_idx: int):
+        file_path = self.file_paths[sim_idx]
+        with h5py.File(file_path, 'r') as f:
+            return self._extract_uvp(f)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _get_worker_info(self):
+        info = get_worker_info()
+        return (0, 1) if info is None else (info.id, info.num_workers)
+
+    def __iter__(self):
+        worker_id, num_workers = self._get_worker_info()
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+
+        all_indices = np.array(self.sim_indices)
+        if global_num_workers <= 1:
+            worker_indices = all_indices.tolist()
+        else:
+            worker_indices = np.array_split(all_indices, global_num_workers)[global_worker_id].tolist()
+        
+        rng = np.random.default_rng(self.seed + global_worker_id + self.epoch)
+        if self.is_train:
+            rng.shuffle(worker_indices)
+            
+        for sim_idx in worker_indices:
+            file_path = self.file_paths[sim_idx]
+            coords_sim = self.coords_per_sim[sim_idx]
+            with h5py.File(file_path, 'r') as f:
+                u, v, p = self._extract_uvp(f)
+                fields_sim = np.stack([u, v, p], axis=-1)  # [T, N, 3]
+
+                if self.return_mesh_info:
+                    cells = np.array(f['cells'], dtype=np.int32)
+                    node_type = np.array(f['node_type'], dtype=np.int32)
+
+                    if node_type.ndim == 2 and node_type.shape[-1] == 1:
+                        node_type = node_type[:, 0]
+                    if node_type.ndim == 1:
+                        node_type = np.broadcast_to(node_type[None, :], (fields_sim.shape[0], node_type.shape[0]))
+                    elif node_type.ndim == 2 and node_type.shape[0] == fields_sim.shape[0]:
+                        pass
+                    elif node_type.ndim == 3 and node_type.shape[-1] == 1 and node_type.shape[0] == fields_sim.shape[0]:
+                        node_type = node_type[..., 0]
+                    else:
+                        raise ValueError(f"node_type shape is not supported: {node_type.shape}")
+
+            if fields_sim.shape[0] < self.chunk_size:
+                continue
+
+            for t_start in range(0, fields_sim.shape[0] - self.chunk_size + 1, self.stride):
+                chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
+                if self.return_mesh_info:
+                    chunk_node_type = node_type[t_start : t_start + self.chunk_size]
+                    yield coords_sim, {
+                        'fields': torch.tensor(chunk_fields, dtype=torch.float32),
+                        'cells': torch.tensor(cells, dtype=torch.long),
+                        'node_type': torch.tensor(chunk_node_type, dtype=torch.long)
+                    }
+                else:
+                    yield coords_sim, torch.tensor(chunk_fields, dtype=torch.float32)
