@@ -14,7 +14,7 @@ from tqdm import tqdm
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
 from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
-from src.models_v2 import GaborRenderer_v2, GaborRenderer_v3, HyperNetwork_Perceiver_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v4, HyperNetwork_Perceiver_v4
+from src.models_v2 import GaborRenderer_v2, GaborRenderer_v3, HyperNetwork_Perceiver_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v4, HyperNetwork_Perceiver_v4,HyperNetwork_Perceiver_v5, GaborRenderer_v5
 from src.normalize import Normalizer_ts, compute_dataset_statistics
 
 
@@ -231,6 +231,17 @@ def train(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=USE_NODE_TYPE,
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
+        print("Using Perceiver_v5-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v5(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE,
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         # HyperNetwork encodes noisy trajectories -> Z1 | Renderer decodes Z1 + Coords -> predicted trajectories
@@ -261,6 +272,9 @@ def train(hp):
     elif RENDERER_TYPE == "GaborRenderer_v4":
         print("Using V4-based GaborRenderer")
         cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v5":
+        print("Using V5-based GaborRenderer")
+        cnf = GaborRenderer_v5(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
