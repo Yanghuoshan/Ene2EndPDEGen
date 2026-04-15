@@ -103,6 +103,7 @@ def train(hp):
     TEACHER_T_DELTA = getattr(hp, "teacher_t_delta", 0.1)
     AUTO_RESUME = getattr(hp, "auto_resume", True)
     RESUME_CHECKPOINT = getattr(hp, "resume_checkpoint", "latest")
+    USE_NODE_TYPE = getattr(hp, "use_node_type", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -125,7 +126,8 @@ def train(hp):
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             stride=STRIDE,
-            mode='train'
+            mode='train',
+            return_mesh_info=USE_NODE_TYPE
         )
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
     except Exception as e:
@@ -227,6 +229,7 @@ def train(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE,
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -257,7 +260,7 @@ def train(hp):
         cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v4":
         print("Using V4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
@@ -355,7 +358,15 @@ def train(hp):
         loss_t_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
         loss_t_counts = { '1.0': 0, '0.75': 0, '0.5': 0, '0.25': 0, '0.0': 0 }
         
-        for step, (coords_batch, traj_batch) in enumerate(dataloader):
+        for step, batch_data in enumerate(dataloader):
+            if USE_NODE_TYPE:
+                coords_batch, mesh_info = batch_data
+                traj_batch = mesh_info['fields']
+                node_type = mesh_info['node_type'].to(device)
+            else:
+                coords_batch, traj_batch = batch_data
+                node_type = None
+
             # coords_batch: [B, N, 2]
             # traj_batch:   [B, T, N, C]
             coords = coords_batch.to(device)
@@ -397,16 +408,23 @@ def train(hp):
             
             # 1. Predict clean dynamic latent Z1 from noisy data and coords 
             # Note: We pass `coords` and `t` so the network knows where the sensors are and noise-level
-            z1_pred = encoder(x_noisy, coords, t) # [B, LATENT_DIM]
+            if USE_NODE_TYPE:
+                z1_pred = encoder(x_noisy, coords, t, node_type) # [B, LATENT_DIM]
+            else:
+                z1_pred = encoder(x_noisy, coords, t) # [B, LATENT_DIM]
 
             with torch.no_grad():
-                z_target = encoder_ema(x_noisy_teacher, coords, t_teacher).detach()
+                if USE_NODE_TYPE:
+                    z_target = encoder_ema(x_noisy_teacher, coords, t_teacher, node_type).detach()
+                else:
+                    z_target = encoder_ema(x_noisy_teacher, coords, t_teacher).detach()
             
             # 2. Render trajectory directly using Z1 and spatial coordinates
             # Target output corresponds to the Clean trajectory
-            x_pred = cnf(z1_pred, coords) # [B, T_CHUNK, N, C]
-            
-            # ===== C. Data-Space Supervision =====
+            if USE_NODE_TYPE:
+                x_pred = cnf(z1_pred, coords, node_type) # [B, T_CHUNK, N, C]
+            else:
+                x_pred = cnf(z1_pred, coords) # [B, T_CHUNK, N, C]
             # Instead of comparing Z, we directly enforce MSE on the physical fields!
             element_loss = F.mse_loss(x_pred, x_real, reduction='none')
             sample_loss = element_loss.reshape(B, -1).mean(dim=1)

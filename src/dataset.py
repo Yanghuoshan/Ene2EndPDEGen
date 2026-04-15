@@ -172,7 +172,7 @@ class H5DirectoryChunkDataset(IterableDataset):
                 coords = np.array(f['mesh_pos'], dtype=np.float32)
                 if coords.ndim == 3 and coords.shape[-1] == 2:
                     # mesh_pos may be stored as [T, N, 2] even when mesh is time-invariant.
-                    coords = coords[0]
+                    coords = coords[0] # [N, 2]
                 if coords.ndim != 2 or coords.shape[-1] != 2:
                     raise ValueError(
                         f"mesh_pos must have shape [N, 2] or [T, N, 2], got {coords.shape} in {file_path}"
@@ -180,7 +180,7 @@ class H5DirectoryChunkDataset(IterableDataset):
                 self.coords_per_sim.append(torch.tensor(coords, dtype=torch.float32))
 
         # Keep legacy attribute used by normalize.py; concat gives global coord stats.
-        self.coords = torch.cat(self.coords_per_sim, dim=0)
+        self.coords = torch.cat(self.coords_per_sim, dim=0) # 
 
         with h5py.File(self.file_paths[0], 'r') as f:
             u0, v0, p0 = self._extract_uvp(f)
@@ -262,25 +262,25 @@ class H5DirectoryChunkDataset(IterableDataset):
             
         for sim_idx in worker_indices:
             file_path = self.file_paths[sim_idx]
-            coords_sim = self.coords_per_sim[sim_idx]
+            coords_sim = self.coords_per_sim[sim_idx] # [N, 2]
             with h5py.File(file_path, 'r') as f:
                 u, v, p = self._extract_uvp(f)
                 fields_sim = np.stack([u, v, p], axis=-1)  # [T, N, 3]
 
                 if self.return_mesh_info:
                     cells = np.array(f['cells'], dtype=np.int32)
+                    if cells.ndim == 3:
+                        cells = cells[0]  # [N, num_vertex]
+                        
                     node_type = np.array(f['node_type'], dtype=np.int32)
-
-                    if node_type.ndim == 2 and node_type.shape[-1] == 1:
-                        node_type = node_type[:, 0]
-                    if node_type.ndim == 1:
-                        node_type = np.broadcast_to(node_type[None, :], (fields_sim.shape[0], node_type.shape[0]))
+                    
+                    if node_type.ndim == 3:
+                        node_type = node_type[0]
                     elif node_type.ndim == 2 and node_type.shape[0] == fields_sim.shape[0]:
-                        pass
-                    elif node_type.ndim == 3 and node_type.shape[-1] == 1 and node_type.shape[0] == fields_sim.shape[0]:
-                        node_type = node_type[..., 0]
-                    else:
-                        raise ValueError(f"node_type shape is not supported: {node_type.shape}")
+                        node_type = node_type[0] # [N] or [N, 1]
+                        
+                    if node_type.ndim == 1:
+                        node_type = node_type[:, None]  # [N, 1]
 
             if fields_sim.shape[0] < self.chunk_size:
                 continue
@@ -288,11 +288,10 @@ class H5DirectoryChunkDataset(IterableDataset):
             for t_start in range(0, fields_sim.shape[0] - self.chunk_size + 1, self.stride):
                 chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
                 if self.return_mesh_info:
-                    chunk_node_type = node_type[t_start : t_start + self.chunk_size]
                     yield coords_sim, {
                         'fields': torch.tensor(chunk_fields, dtype=torch.float32),
                         'cells': torch.tensor(cells, dtype=torch.long),
-                        'node_type': torch.tensor(chunk_node_type, dtype=torch.long)
+                        'node_type': torch.tensor(node_type, dtype=torch.long)
                     }
                 else:
                     yield coords_sim, torch.tensor(chunk_fields, dtype=torch.float32)

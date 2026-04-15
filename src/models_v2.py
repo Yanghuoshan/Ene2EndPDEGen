@@ -658,7 +658,7 @@ class HyperNetwork_Perceiver_v4(nn.Module):
     """
     DiT-style Set Encoder (Data-Space to Latent Z1).
     """
-    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, fno_modes=8, use_fft=False):
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, fno_modes=8, use_fft=False, use_node_type=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_in = channel_in
@@ -667,8 +667,10 @@ class HyperNetwork_Perceiver_v4(nn.Module):
         self.fourier_dim = fourier_dim
         self.depth = depth
         self.use_fft = use_fft
+        self.use_node_type = use_node_type
+        self.node_type_dim = 10 if use_node_type else 0
 
-        self.coord_encoder = FourierFeatures(in_features=coord_dim, mapping_size=fourier_dim)
+        self.coord_encoder = FourierFeatures(in_features=coord_dim + self.node_type_dim, mapping_size=fourier_dim)
         encoded_coord_dim = fourier_dim * 2
         
         self.time_mlp = nn.Sequential(
@@ -718,11 +720,15 @@ class HyperNetwork_Perceiver_v4(nn.Module):
             nn.LayerNorm(latent_dim)
         )
 
-    def forward(self, x_noisy, coords, t):
+    def forward(self, x_noisy, coords, t, node_type=None):
         """
         x_noisy shape: [B, T, N, C]
         coords shape: [B, N, coord_dim]
         """
+        if self.use_node_type and node_type is not None:
+            node_type_onehot = F.one_hot(node_type.squeeze(-1).long(), num_classes=10).float()
+            coords = torch.cat([coords, node_type_onehot], dim=-1)
+
         B, T, N, C = x_noisy.shape
         
         c = self.time_mlp(t)
@@ -759,17 +765,19 @@ class GaborRenderer_v4(nn.Module):
     Direct faithful translation of GNAutodecoder_film from the official ConditionalNeuralField repo.
     Uses MFN structure with Gabor layers processing pure geometry.
     """
-    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, fno_modes=8, use_fft=False):
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, fno_modes=8, use_fft=False, use_node_type=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_out = channel_out
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.use_fft = use_fft
+        self.use_node_type = use_node_type
+        self.node_type_dim = 10 if use_node_type else 0
         
         self.filters = nn.ModuleList([
             FullGaborLayer(
-                in_features=coord_dim, 
+                in_features=coord_dim + self.node_type_dim, 
                 out_features=hidden_dim, 
                 weight_scale=256.0 / math.sqrt(num_layers + 1), 
                 alpha=6.0 / (num_layers + 1), 
@@ -787,7 +795,7 @@ class GaborRenderer_v4(nn.Module):
         )
 
         self.query_proj = nn.Sequential(
-            nn.Linear(coord_dim, hidden_dim),
+            nn.Linear(coord_dim + self.node_type_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, latent_dim)
         )
@@ -817,7 +825,11 @@ class GaborRenderer_v4(nn.Module):
                 math.sqrt(1.0 / in_dim)
             )
 
-    def forward(self, z_multi, coords):
+    def forward(self, z_multi, coords, node_type=None):
+        if self.use_node_type and node_type is not None:
+            node_type_onehot = F.one_hot(node_type.squeeze(-1).long(), num_classes=10).float()
+            coords = torch.cat([coords, node_type_onehot], dim=-1)
+
         B, N, _ = coords.shape
         x0 = coords
         

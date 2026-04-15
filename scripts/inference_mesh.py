@@ -29,6 +29,7 @@ def inference_demo(hp):
     ENCODER_TYPE = getattr(hp, "encoder_type", "HyperNetwork")
     RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
+    USE_NODE_TYPE = getattr(hp, "use_node_type", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -59,6 +60,10 @@ def inference_demo(hp):
         original_coords = original_coords_sample.unsqueeze(0).clone().detach().to(device) # expand to [1, N, 2]
         cells_tensor = mesh_info['cells']
         gt_fields_tensor = mesh_info['fields'].unsqueeze(0).clone().detach() # shape [1, T_CHUNK, N, C]
+        if USE_NODE_TYPE:
+            node_type_tensor = mesh_info['node_type'].unsqueeze(0).clone().detach().to(device) # shape [1, N, 1]
+        else:
+            node_type_tensor = None
     except Exception as e:
         print(f"Failed to load dataset coords: {e}")
         return
@@ -148,6 +153,7 @@ def inference_demo(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE,
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -171,7 +177,7 @@ def inference_demo(hp):
         cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v4":
         print("Using MFN_v4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
@@ -234,10 +240,16 @@ def inference_demo(hp):
         
         # 4. Hyper-Network extracts the dynamic system latent directly
         # Note: the input noise is already standard normal, coords must be normalized
-        z1_gen = encoder(x_noise, coords_norm, t_target)
+        if USE_NODE_TYPE:
+            z1_gen = encoder(x_noise, coords_norm, t_target, node_type_tensor)
+        else:
+            z1_gen = encoder(x_noise, coords_norm, t_target)
         
         # 5. Render infinite resolution fields continuously
-        trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
+        if USE_NODE_TYPE:
+            trajectory_pred_norm = cnf(z1_gen, coords_norm, node_type_tensor) # [1, T_CHUNK, N, C_OUT]
+        else:
+            trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
         
         # Denormalize output trajectory to physical space
         trajectory_pred = field_normalizer.denormalize(trajectory_pred_norm)

@@ -3,7 +3,7 @@ import os
 import glob
 import torch
 from basicutility import ReadInput as ri
-from src.dataset import TrajectoryChunkDataset
+from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
 from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
 from src.models_v2 import HyperNetwork_Perceiver_v2, GaborRenderer_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v3, HyperNetwork_Perceiver_v4, GaborRenderer_v4
 from src.normalize import Normalizer_ts
@@ -25,9 +25,11 @@ def inference_demo(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
+    STRIDE = getattr(hp, "stride", T_CHUNK)
     ENCODER_TYPE = getattr(hp, "encoder_type", "HyperNetwork")
     RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
+    USE_NODE_TYPE = getattr(hp, "use_node_type", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -39,15 +41,29 @@ def inference_demo(hp):
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
 
     try:
-        dataset = TrajectoryChunkDataset(
+        dataset = H5DirectoryChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
-            use_vo=False,
-            flatten=True,
-            mode='test' # or train
+            stride=STRIDE,
+            mode='test', # or train
+            return_mesh_info=True
         )
+        
+        # 允许在配置文件中指定使用哪个 simulation (sim_idx)，如果不指定则默认随机选取一个
+        import random
+        target_sim_idx = getattr(hp, "sim_idx", random.randint(0, dataset.num_sims - 1))
+        print(f"Using dataset simulation index: {target_sim_idx}")
+        dataset.sim_indices = [target_sim_idx]
+
         # coords shape is [N, 2]
-        original_coords = dataset.coords.unsqueeze(0).to(device) # expand to [1, N, 2]
+        original_coords_sample, mesh_info = next(iter(dataset))
+        original_coords = original_coords_sample.unsqueeze(0).clone().detach().to(device) # expand to [1, N, 2]
+        cells_tensor = mesh_info['cells']
+        gt_fields_tensor = mesh_info['fields'].unsqueeze(0).clone().detach() # shape [1, T_CHUNK, N, C]
+        if USE_NODE_TYPE:
+            node_type_tensor = mesh_info['node_type'].unsqueeze(0).clone().detach().to(device) # shape [1, N, 1]
+        else:
+            node_type_tensor = None
     except Exception as e:
         print(f"Failed to load dataset coords: {e}")
         return
@@ -137,6 +153,7 @@ def inference_demo(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE,
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -160,7 +177,7 @@ def inference_demo(hp):
         cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v4":
         print("Using MFN_v4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
@@ -199,46 +216,66 @@ def inference_demo(hp):
         else:
             print(f"No checkpoint or legacy weights found in {SAVE_PATH}.")
             return
-            
-    encoder_params = sum(p.numel() for p in encoder.parameters())
-    cnf_params = sum(p.numel() for p in cnf.parameters())
-    print(f"Encoder model parameters: {encoder_params / 1e6:.2f}M ({encoder_params})")
-    print(f"Renderer (CNF) model parameters: {cnf_params / 1e6:.2f}M ({cnf_params})")
-    print(f"Total model parameters: {(encoder_params + cnf_params) / 1e6:.2f}M")
     
     encoder.eval()
     cnf.eval()
     
     with torch.no_grad():
-        # 1. Generation begins from PURE NOISE in Data Space
-        # We match N_points with the actual dataset coordinates
+        # 1. 设置基础形状和坐标
         B, T, N, C = 1, T_CHUNK, original_coords.shape[1], C_OUT
         seed = time() % 10000  # simple time-based seed for variability
         print(f"Using random seed: {seed:.0f} for noise generation")
         torch.manual_seed(seed)  # for reproducibility
-        x_noise = torch.randn(B, T, N, C).to(device)
         
-        # 2. We want completely clean data, which corresponds to t=1.0 in our setup
-        t_target = torch.ones(B).to(device)
-        
-        # 3. We use original dataset coordinates for the noise support 
         coords = original_coords # [B, N, 2]
-        
-        # Normalize input coords
         coords_norm = coord_normalizer.normalize(coords)
         
-        # 4. Hyper-Network extracts the dynamic system latent directly
-        # Note: the input noise is already standard normal, coords must be normalized
-        z1_gen = encoder(x_noise, coords_norm, t_target)
+        # 2. 提取真实的初始帧(第一帧)作为引导条件
+        x_init_clean = gt_fields_tensor[:, 0:1, :, :].to(device)
+        x_init_clean_norm = field_normalizer.normalize(x_init_clean)
         
-        # 5. Render infinite resolution fields continuously
-        trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
+        # 3. 定义多步替换引导的时间调度 (从纯噪声 t=1.0 降至纯净 t=0.0)
+        time_steps = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+        x_current = torch.randn(B, T, N, C).to(device)
+        
+        print(f"Starting multi-step guidance with steps: {time_steps}")
+        for i in range(len(time_steps) - 1):
+            t_curr = time_steps[i]    # 当前的噪声水平
+            t_next = time_steps[i+1]  # 下一个较小的噪声水平
+            
+            # --- A. 给干净的第一帧加上当前水平的噪声 ---
+            # 这里假定前向加噪过程为线性调度: x_t = (1-t)*x_0 + t*noise
+            noise_for_init = torch.randn_like(x_init_clean_norm)
+            x_init_t = (1.0 - t_curr) * x_init_clean_norm + t_curr * noise_for_init
+            
+            # --- B. 强制替换当前带噪序列的第一帧 (Replacement Trick) ---
+            x_current[:, 0:1, :, :] = x_init_t
+            
+            # --- C. 预测出完全干净的全序列 ---
+            t_tensor = (torch.ones(B) * t_curr).to(device)
+            if USE_NODE_TYPE:
+                z1_gen = encoder(x_current, coords_norm, t_tensor, node_type_tensor)
+                x_0_pred = cnf(z1_gen, coords_norm, node_type_tensor)
+            else:
+                z1_gen = encoder(x_current, coords_norm, t_tensor)
+                x_0_pred = cnf(z1_gen, coords_norm)
+            
+            # --- D. 退回倒下一步 (添加 t_next 水平的噪声) ---
+            if t_next > 0.0:
+                noise_resample = torch.randn_like(x_0_pred)
+                x_current = (1.0 - t_next) * x_0_pred + t_next * noise_resample
+            else:
+                # 如果下一步是 0，预测的 x_0_pred 即可作为最终输出
+                trajectory_pred_norm = x_0_pred
+                
+        # 4. 最后一步强行确保第一帧完美等于 ground truth
+        trajectory_pred_norm[:, 0:1, :, :] = x_init_clean_norm
         
         # Denormalize output trajectory to physical space
         trajectory_pred = field_normalizer.denormalize(trajectory_pred_norm)
         
         print(f"Generated clean trajectory shape: {trajectory_pred.shape}")
-        print("Success! One-step generation achieved via integrated CNF & Flow Data-space training.")
+        print("Success! Guided generation achieved using multi-step replacement trick.")
         
         # Save visualization directly after generation
         from matplotlib import pyplot as plt
@@ -246,38 +283,73 @@ def inference_demo(hp):
         import matplotlib.tri as mtri
         import numpy as np
 
-        field = trajectory_pred.detach().cpu().numpy()
+        field_pred = trajectory_pred.detach().cpu().numpy()  # [1, T_CHUNK, N, C]
+        field_gt = gt_fields_tensor.cpu().numpy()            # [1, T_CHUNK, N, C]
         coord = coords[0].detach().cpu().numpy()
+        cells = cells_tensor.detach().cpu().numpy()
         
-        frames = field.shape[1]  # T_CHUNK
-        data0 = field[0, 0]      # first batch, first timestep [N, C]
+        frames = field_pred.shape[1]  # T_CHUNK
         
-        if data0.ndim == 2 and data0.shape[1] > 1:
-            values0 = np.linalg.norm(data0, axis=1)
-        else:
-            values0 = data0.squeeze()
-
         x = coord[:, 0]
         y = coord[:, 1]
-        tri = mtri.Triangulation(x, y)
+        
+        # cells dimensions: [T, N, 3] or [N, 3], we take the first frame's connectivity.
+        if cells.ndim == 3:
+            triangles = cells[0]
+        else:
+            triangles = cells
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        tpc = ax.tripcolor(tri, values0, shading="gouraud", cmap="viridis")
-        ax.set_aspect('equal')
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        title = ax.set_title("Generated Field (time=0)")
-        cbar = plt.colorbar(tpc, ax=ax, label="Velocity Magnitude")
+        tri = mtri.Triangulation(x, y, triangles)
+
+        def get_face_values(data):
+            # Compute velocity magnitude ||(u, v)|| from the first two channels.
+            if data.ndim == 2 and data.shape[1] >= 2:
+                values = np.linalg.norm(data[:, :2], axis=1)
+            else:
+                values = np.abs(data.squeeze())
+            # Each triangle gets meant value of its 3 vertices
+            return values[triangles].mean(axis=1)
+
+        face_values0_pred = get_face_values(field_pred[0, 0])
+        face_values0_gt = get_face_values(field_gt[0, 0])
+        
+        fig, (ax_gt, ax_pred) = plt.subplots(1, 2, figsize=(16, 6))
+
+        # 统一和固定 colorbar 范围可以更好地比较，不过这里我们默认使用单独范围，或随时间自动更新。
+        tpc_gt = ax_gt.tripcolor(tri, facecolors=face_values0_gt, cmap="viridis")
+        ax_gt.triplot(tri, color='black', linewidth=0.2, alpha=0.5)
+        ax_gt.set_aspect('equal')
+        ax_gt.set_xlabel("x")
+        ax_gt.set_ylabel("y")
+        title_gt = ax_gt.set_title("Ground Truth (time=0)")
+        
+        tpc_pred = ax_pred.tripcolor(tri, facecolors=face_values0_pred, cmap="viridis")
+        ax_pred.triplot(tri, color='black', linewidth=0.2, alpha=0.5)
+        ax_pred.set_aspect('equal')
+        ax_pred.set_xlabel("x")
+        ax_pred.set_ylabel("y")
+        title_pred = ax_pred.set_title("Prediction (time=0)")
+
+        # 组合的 colorbar
+        cbar = plt.colorbar(tpc_pred, ax=[ax_gt, ax_pred], fraction=0.03, pad=0.04, label="Velocity Magnitude |(u,v)|")
 
         def update(t):
-            data = field[0, t]
-            if data.ndim == 2 and data.shape[1] > 1:
-                values = np.linalg.norm(data, axis=1)
-            else:
-                values = data.squeeze()
-            tpc.set_array(values)
-            title.set_text(f"Generated Field (time={t})")
-            return tpc, title
+            fv_gt = get_face_values(field_gt[0, t])
+            fv_pred = get_face_values(field_pred[0, t])
+            
+            # 更新颜色
+            tpc_gt.set_array(fv_gt)
+            tpc_pred.set_array(fv_pred)
+            
+            # 动态更新 color limits 使其能够包容两者的最大最小值
+            vmin = min(fv_gt.min(), fv_pred.min())
+            vmax = max(fv_gt.max(), fv_pred.max())
+            tpc_gt.set_clim(vmin, vmax)
+            tpc_pred.set_clim(vmin, vmax)
+            
+            title_gt.set_text(f"Ground Truth (time={t})")
+            title_pred.set_text(f"Prediction (time={t})")
+            return tpc_gt, tpc_pred, title_gt, title_pred
 
         ani = animation.FuncAnimation(fig, update, frames=range(frames), interval=80, blit=False)
 
