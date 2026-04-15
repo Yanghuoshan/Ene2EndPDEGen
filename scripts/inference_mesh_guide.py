@@ -223,8 +223,8 @@ def inference_demo(hp):
     with torch.no_grad():
         # 1. 设置基础形状和坐标
         B, T, N, C = 1, T_CHUNK, original_coords.shape[1], C_OUT
-        seed = time() % 10000  # simple time-based seed for variability
-        print(f"Using random seed: {seed:.0f} for noise generation")
+        seed = int(time() % 10000)  # simple time-based seed for variability
+        print(f"Using random seed: {seed} for noise generation")
         torch.manual_seed(seed)  # for reproducibility
         
         coords = original_coords # [B, N, 2]
@@ -235,7 +235,7 @@ def inference_demo(hp):
         x_init_clean_norm = field_normalizer.normalize(x_init_clean)
         
         # 3. 定义多步替换引导的时间调度 (从纯噪声 t=1.0 降至纯净 t=0.0)
-        time_steps = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+        time_steps = [x/50.0 for x in range(50, -1, -1)]  # 可以根据需要调整步数和每步的噪声水平
         x_current = torch.randn(B, T, N, C).to(device)
         
         print(f"Starting multi-step guidance with steps: {time_steps}")
