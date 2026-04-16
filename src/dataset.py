@@ -295,3 +295,97 @@ class H5DirectoryChunkDataset(IterableDataset):
                     }
                 else:
                     yield coords_sim, torch.tensor(chunk_fields, dtype=torch.float32)
+
+class ShallowWaterChunkDataset(IterableDataset):
+    """
+    Reads shallow water h5 files (traj_0000.h5, ...) from a directory.
+    Each h5 file is treated as one full trajectory and chunked along its time axis.
+    """
+    def __init__(
+        self,
+        dataset_path: str,
+        chunk_size: int = 16,
+        stride: int = None,
+        mode: str = "train",
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.dataset_path = dataset_path
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+        self.chunk_size = chunk_size
+        self.stride = stride if stride is not None else chunk_size // 2
+        if self.stride <= 0:
+            raise ValueError(f"stride must be > 0, got {self.stride}")
+        self.mode = mode
+        self.seed = seed
+        self.is_train = mode == "train"
+
+        # List all h5 files in the directory
+        self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.h5"))
+        self.file_paths.sort()
+        self.num_sims = len(self.file_paths)
+
+        if self.num_sims == 0:
+            raise ValueError(f"No h5 files found in {self.dataset_path}")
+
+        # Extract mesh info from the first file
+        with h5py.File(self.file_paths[0], 'r') as f:
+            # Dynamically fetch phi and theta keys as they might have a hash suffix
+            phi_key = [k for k in f['scales'].keys() if k.startswith('phi')][0]
+            theta_key = [k for k in f['scales'].keys() if k.startswith('theta')][0]
+            phi = f['scales'][phi_key][:]
+            theta = f['scales'][theta_key][:]
+            
+            # Create a 2D grid coordinates [N_points, 2]
+            Phi, Theta = np.meshgrid(phi, theta, indexing='ij')
+            self.coords = torch.tensor(np.stack([Phi, Theta], axis=-1), dtype=torch.float32).reshape(-1, 2)
+            
+            v0 = f['tasks']['vorticity']
+            self.traj_len = v0.shape[0]
+            
+        self.sim_indices = list(range(self.num_sims))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _get_worker_info(self):
+        info = get_worker_info()
+        return (0, 1) if info is None else (info.id, info.num_workers)
+
+    def __iter__(self):
+        worker_id, num_workers = self._get_worker_info()
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+
+        all_indices = np.array(self.sim_indices)
+        if global_num_workers <= 1:
+            worker_indices = all_indices.tolist()
+        else:
+            worker_indices = np.array_split(all_indices, global_num_workers)[global_worker_id].tolist()
+        
+        rng = np.random.default_rng(self.seed + global_worker_id + self.epoch)
+        if self.is_train:
+            rng.shuffle(worker_indices)
+            
+        for sim_idx in worker_indices:
+            file_path = self.file_paths[sim_idx]
+            with h5py.File(file_path, 'r') as f:
+                vorticity = np.array(f['tasks']['vorticity'], dtype=np.float32)  # [T, N_x, N_y]
+                height = np.array(f['tasks']['height'], dtype=np.float32)        # [T, N_x, N_y]
+                
+                # Stack features -> [T, N_x, N_y, 2] -> [T, N_points, 2]
+                fields_sim = np.stack([vorticity, height], axis=-1)
+                fields_sim = fields_sim.reshape(fields_sim.shape[0], -1, fields_sim.shape[-1])
+
+            if fields_sim.shape[0] < self.chunk_size:
+                continue
+
+            for t_start in range(0, fields_sim.shape[0] - self.chunk_size + 1, self.stride):
+                chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
+                yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)
+
