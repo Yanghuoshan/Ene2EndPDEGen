@@ -5,7 +5,7 @@ import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
 from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
-from src.models_v2 import HyperNetwork_Perceiver_v2, GaborRenderer_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v3, HyperNetwork_Perceiver_v4, GaborRenderer_v4
+from src.models_v2 import HyperNetwork_Perceiver_v2, GaborRenderer_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v3, HyperNetwork_Perceiver_v4, GaborRenderer_v4, HyperNetwork_Perceiver_v5, GaborRenderer_v5
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -138,6 +138,16 @@ def inference_demo(hp):
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
+        print("Using Perceiver_v5-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v5(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -161,6 +171,9 @@ def inference_demo(hp):
     elif RENDERER_TYPE == "GaborRenderer_v4":
         print("Using MFN_v4-based GaborRenderer")
         cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v5":
+        print("Using MFN_v5-based GaborRenderer")
+        cnf = GaborRenderer_v5(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
