@@ -3,3 +3,5 @@ saves/
 *.yaml
 *.yml
 __pycache__/
+log/
+yml/
