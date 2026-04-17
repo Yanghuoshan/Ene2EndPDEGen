@@ -81,6 +81,7 @@ def train(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
+    RENDERER_TYPE = getattr(hp, "renderer_type", "gabor")
 
     EPOCHS = getattr(hp, "epochs", 50)
     BATCH_SIZE = getattr(hp, "batch_size", 32)
@@ -188,6 +189,7 @@ def train(hp):
         num_tokens=NUM_TOKENS,
         fourier_dim=64,
         num_layers=NUM_LAYERS_CNF,
+        renderer_type= RENDERER_TYPE,
         use_node_type=False
     ).to(device)
 

@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sre.siren import SIRENRenderer
+
 
 def modulate(x, shift, scale):
     """Adaptive Layer Norm modulation."""
@@ -358,11 +360,12 @@ class GaborRenderer_v2(nn.Module):
 class FullModel_v21(nn.Module):
     """
     End-to-End Model encapsulating the shared Fourier and Node Type Embeddings,
-    as well as the HyperNetwork Encoder and GaborRenderer Decoder.
+    as well as the HyperNetwork Encoder and GaborRenderer/SIRENRenderer Decoder.
     """
     def __init__(self, t_chunk=16, channel_in=2, channel_out=2, coord_dim=2, latent_dim=256, 
                  time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, 
-                 fourier_dim=64, num_layers=4, use_node_type=False, num_node_types=6, node_type_dim=16):
+                 fourier_dim=64, num_layers=4, use_node_type=False, num_node_types=6, node_type_dim=16,
+                 renderer_type='gabor'):
         super().__init__()
         self.use_node_type = use_node_type
         
@@ -379,12 +382,21 @@ class FullModel_v21(nn.Module):
             node_type_dim=node_type_dim
         )
         
-        self.decoder = GaborRenderer_v2(
-            latent_dim=latent_dim, coord_dim=coord_dim, t_chunk=t_chunk, channel_out=channel_out, 
-            hidden_dim=hidden_dim, num_layers=num_layers, use_node_type=use_node_type, 
-            node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2
-        )
-
+        if renderer_type == 'siren':
+            self.decoder = SIRENRenderer(
+                latent_dim=latent_dim, coord_dim=coord_dim, t_chunk=t_chunk, channel_out=channel_out, 
+                hidden_dim=hidden_dim, num_layers=num_layers, use_node_type=use_node_type, 
+                node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2
+            )
+            print("Using SIREN Renderer")
+        else:
+            self.decoder = GaborRenderer_v2(
+                latent_dim=latent_dim, coord_dim=coord_dim, t_chunk=t_chunk, channel_out=channel_out, 
+                hidden_dim=hidden_dim, num_layers=num_layers, use_node_type=use_node_type, 
+                node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2
+            )
+            print("Using Gabor Renderer")
+            
     def forward(self, x_noisy, t, input_coords, query_coords, input_node_type=None, query_node_type=None):
         # 1. Encode coordinates
         input_coords_encoded = self.coord_encoder(input_coords)
