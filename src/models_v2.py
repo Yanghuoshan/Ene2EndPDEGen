@@ -1046,7 +1046,7 @@ class GaborRenderer_v5(nn.Module):
             )
 
     def forward(self, z_multi, coords, node_type=None):
-        if self.use_node_type and node_type is not None:
+        if self.use_node_type and node_type is not None: # [B, N, 1]
             node_type_onehot = F.one_hot(node_type.squeeze(-1).long(), num_classes=10).float()
             coords = torch.cat([coords, node_type_onehot], dim=-1)
 
