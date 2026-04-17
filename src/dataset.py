@@ -196,40 +196,44 @@ class H5DirectoryChunkDataset(IterableDataset):
 
     def _extract_uvp(self, h5_file):
         velocity = np.array(h5_file['velocity'], dtype=np.float32)
-        pressure = np.array(h5_file['pressure'], dtype=np.float32)
+        if self.include_pressure:
+            pressure = np.array(h5_file['pressure'], dtype=np.float32)
 
         if velocity.ndim == 2 and velocity.shape[-1] == 2:
             velocity = velocity[None, ...]
         if velocity.ndim != 3 or velocity.shape[-1] != 2:
             raise ValueError(f"velocity must have shape [T, N, 2] or [N, 2], got {velocity.shape}")
 
-        if pressure.ndim == 1:
-            pressure = pressure[None, :]
-        elif pressure.ndim == 3 and pressure.shape[-1] == 1:
-            pressure = pressure[..., 0]
-        elif pressure.ndim == 2:
-            pass
-        else:
-            raise ValueError(f"pressure must have shape [T, N], [T, N, 1], [N] or [N, 1], got {pressure.shape}")
-
-        if pressure.shape[0] != velocity.shape[0]:
-            if pressure.shape[0] == 1 and velocity.shape[0] > 1:
-                pressure = np.repeat(pressure, velocity.shape[0], axis=0)
+        if self.include_pressure:
+            if pressure.ndim == 1:
+                pressure = pressure[None, :]
+            elif pressure.ndim == 3 and pressure.shape[-1] == 1:
+                pressure = pressure[..., 0]
+            elif pressure.ndim == 2:
+                pass
             else:
-                raise ValueError(
-                    f"time length mismatch between velocity and pressure: "
-                    f"{velocity.shape[0]} vs {pressure.shape[0]}"
-                )
+                raise ValueError(f"pressure must have shape [T, N], [T, N, 1], [N] or [N, 1], got {pressure.shape}")
 
-        if pressure.shape[1] != velocity.shape[1]:
-            raise ValueError(
-                f"node count mismatch between velocity and pressure: "
-                f"{velocity.shape[1]} vs {pressure.shape[1]}"
-            )
+            if pressure.shape[0] != velocity.shape[0]:
+                if pressure.shape[0] == 1 and velocity.shape[0] > 1:
+                    pressure = np.repeat(pressure, velocity.shape[0], axis=0)
+                else:
+                    raise ValueError(
+                        f"time length mismatch between velocity and pressure: "
+                        f"{velocity.shape[0]} vs {pressure.shape[0]}"
+                    )
+
+            if pressure.shape[1] != velocity.shape[1]:
+                raise ValueError(
+                    f"node count mismatch between velocity and pressure: "
+                    f"{velocity.shape[1]} vs {pressure.shape[1]}"
+                )
+            p = pressure
+        else:
+            p = None
 
         u = velocity[..., 0]
         v = velocity[..., 1]
-        p = pressure
         return u, v, p
 
     def _load_sim_data(self, sim_idx: int):

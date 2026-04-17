@@ -104,6 +104,7 @@ def train(hp):
     AUTO_RESUME = getattr(hp, "auto_resume", True)
     RESUME_CHECKPOINT = getattr(hp, "resume_checkpoint", "latest")
     USE_NODE_TYPE = getattr(hp, "use_node_type", False)
+    INCLUDE_PRESSURE = getattr(hp, "include_pressure", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -127,7 +128,8 @@ def train(hp):
             chunk_size=T_CHUNK,
             stride=STRIDE,
             mode='train',
-            return_mesh_info=USE_NODE_TYPE
+            return_mesh_info=USE_NODE_TYPE,
+            include_pressure=INCLUDE_PRESSURE
         )
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
     except Exception as e:
