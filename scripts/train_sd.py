@@ -16,6 +16,7 @@ from src.dataset import TrajectoryChunkDataset
 from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
 from src.models_v2 import GaborRenderer_v2, GaborRenderer_v3, HyperNetwork_Perceiver_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v4, HyperNetwork_Perceiver_v4,HyperNetwork_Perceiver_v5, GaborRenderer_v5
 from src.normalize import Normalizer_ts, compute_dataset_statistics
+from src.utils import display_current_data_time
 
 
 def _unwrap_state_dict(model):
@@ -591,6 +592,8 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python -m scripts.train <config.yml>")
         sys.exit(1)
-        
+    
+    display_current_data_time()
+    print("Loading configuration and starting training...")
     hp = ri.basic_input(sys.argv[-1])
     train(hp)

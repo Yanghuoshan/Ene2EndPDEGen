@@ -24,7 +24,6 @@ def inference_demo(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
-    RENDERER_TYPE = getattr(hp, "renderer_type", "gabor")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
     
     # Normalizer configs
@@ -93,7 +92,6 @@ def inference_demo(hp):
         num_tokens=NUM_TOKENS,
         fourier_dim=64,
         num_layers=NUM_LAYERS_CNF,
-        renderer_type= RENDERER_TYPE,
         use_node_type=False
     ).to(device)
     
@@ -137,9 +135,9 @@ def inference_demo(hp):
         torch.manual_seed(seed)  # for reproducibility
         x_noise = torch.randn(B, T, N, C).to(device)
         
-        # 2. We want completely clean data, which corresponds to t=1.0 in our setup
+        # 2. We want completely clean data, which corresponds to t=0.0 in our setup (pure noise input)
         # The time step is scaled by 1000.0 for the model's SinusoidalPositionEmbeddings
-        t_target = torch.ones(B).to(device)
+        t_target = torch.zeros(B).to(device)
         t_scaled = t_target * 1000.0
         
         # 3. We use original dataset coordinates for the noise support 

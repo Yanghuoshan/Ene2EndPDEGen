@@ -15,6 +15,7 @@ from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
 from src.models_v21 import FullModel_v21
 from src.normalize import Normalizer_ts, compute_dataset_statistics
+from src.utils import display_current_data_time
 
 
 def _unwrap_state_dict(model):
@@ -463,6 +464,9 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python -m scripts.train <config.yml>")
         sys.exit(1)
+
+    display_current_data_time()
+    print("Loading configuration and starting training...")
         
     hp = ri.basic_input(sys.argv[-1])
     train(hp)

@@ -232,7 +232,8 @@ def inference_demo(hp):
         x_noise = torch.randn(B, T, N, C).to(device)
         
         # 2. We want completely clean data, which corresponds to t=1.0 in our setup
-        t_target = torch.ones(B).to(device)
+        # Wait, the input x_noise is pure noise, so its corresponding t is 0.0 in our setup
+        t_target = torch.zeros(B).to(device)
         
         # 3. We use original dataset coordinates for the noise support 
         coords = original_coords # [B, N, 2]

@@ -139,7 +139,7 @@ def inference_demo(hp):
         
         # 2. We want completely clean data, which corresponds to t=1.0 in our setup
         # The time step is scaled by 1000.0 for the model's SinusoidalPositionEmbeddings
-        t_target = torch.ones(B).to(device)
+        t_target = torch.zeros(B).to(device)
         t_scaled = t_target * 1000.0
         
         # 3. We use original dataset coordinates for the noise support 

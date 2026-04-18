@@ -234,7 +234,7 @@ def inference_demo(hp):
         x_init_clean = gt_fields_tensor[:, 0:1, :, :].to(device)
         x_init_clean_norm = field_normalizer.normalize(x_init_clean)
         
-        # 3. 定义多步替换引导的时间调度 (从纯噪声 t=1.0 降至纯净 t=0.0)
+        # 3. 定义多步替换引导的时间调度 (从纯噪声 t=1.0 降至纯净 t=0.0) # 时间步反了，还没修改，改了删掉此注释
         time_steps = [x/50.0 for x in range(50, -1, -1)]  # 可以根据需要调整步数和每步的噪声水平
         x_current = torch.randn(B, T, N, C).to(device)
         
