@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from basicutility import ReadInput as ri
-from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
+from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset, ShallowWaterChunkDataset
 from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
 from src.models_v2 import GaborRenderer_v2, GaborRenderer_v3, HyperNetwork_Perceiver_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v4, HyperNetwork_Perceiver_v4,HyperNetwork_Perceiver_v5, GaborRenderer_v5
 from src.normalize import Normalizer_ts, compute_dataset_statistics
@@ -61,8 +61,9 @@ def _find_latest_checkpoint(save_path):
 
 def _ema_update(ema_model, online_model, decay):
     online_state = _unwrap_state_dict(online_model)
+    target_ema_model = ema_model.module if isinstance(ema_model, nn.DataParallel) else ema_model
     with torch.no_grad():
-        for k, ema_v in ema_model.state_dict().items():
+        for k, ema_v in target_ema_model.state_dict().items():
             online_v = online_state[k].detach()
             if torch.is_floating_point(ema_v):
                 ema_v.mul_(decay).add_(online_v, alpha=(1.0 - decay))
@@ -93,7 +94,7 @@ def train(hp):
     LR_cnf = getattr(hp, "lr_cnf", 1e-4)
     STRIDE = getattr(hp, "stride", T_CHUNK)
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
-    USE_MULTI_GPU = getattr(hp, "use_multi_gpu", False)
+    USE_MULTI_GPU = getattr(hp, "use_multi_gpu", True)
     GPU_IDS_CFG = getattr(hp, "gpu_ids", None)
     SAVE_EVERY_EPOCHS = getattr(hp, "save_every_epochs", 10)
     SAVE_EVERY_STEPS = getattr(hp, "save_every_steps", 0)  # 0 to disable step-level saving
@@ -122,12 +123,11 @@ def train(hp):
     # 2. Build Dataset & DataLoader
     # (Wrapped in try/except so if dataset path is missing, users know what to edit)
     try:
-        dataset = H5DirectoryChunkDataset(
+        dataset = ShallowWaterChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             stride=STRIDE,
-            mode='train',
-            return_mesh_info=USE_NODE_TYPE
+            mode='train'
         )
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
     except Exception as e:
@@ -287,6 +287,7 @@ def train(hp):
             if len(device_ids) > 1:
                 encoder = nn.DataParallel(encoder, device_ids=device_ids)
                 cnf = nn.DataParallel(cnf, device_ids=device_ids)
+                encoder_ema = nn.DataParallel(encoder_ema, device_ids=device_ids)
                 print(f"Multi-GPU enabled (DataParallel), device_ids={device_ids}")
             else:
                 print(f"use_multi_gpu=True but valid gpu_ids={device_ids}, fallback to single GPU training")
@@ -338,7 +339,7 @@ def train(hp):
         _load_model_state_dict(encoder, ckpt['encoder_state_dict'])
         _load_model_state_dict(cnf, ckpt['cnf_state_dict'])
         if 'encoder_ema_state_dict' in ckpt:
-            encoder_ema.load_state_dict(ckpt['encoder_ema_state_dict'])
+            _load_model_state_dict(encoder_ema, ckpt['encoder_ema_state_dict'])
         else:
             _load_model_state_dict(encoder_ema, _unwrap_state_dict(encoder))
             print("Checkpoint has no encoder_ema_state_dict, EMA initialized from online encoder.")
@@ -482,7 +483,7 @@ def train(hp):
                     'epoch': epoch + 1,
                     'global_step': global_step,
                     'encoder_state_dict': _unwrap_state_dict(encoder),
-                    'encoder_ema_state_dict': encoder_ema.state_dict(),
+                    'encoder_ema_state_dict': _unwrap_state_dict(encoder_ema),
                     'cnf_state_dict': _unwrap_state_dict(cnf),
                     'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
                     'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
@@ -565,7 +566,7 @@ def train(hp):
                 'epoch': epoch + 1,
                 'global_step': global_step,
                 'encoder_state_dict': _unwrap_state_dict(encoder),
-                'encoder_ema_state_dict': encoder_ema.state_dict(),
+                'encoder_ema_state_dict': _unwrap_state_dict(encoder_ema),
                 'cnf_state_dict': _unwrap_state_dict(cnf),
                 'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
                 'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
@@ -578,7 +579,7 @@ def train(hp):
         'epoch': EPOCHS,
         'global_step': global_step,
         'encoder_state_dict': _unwrap_state_dict(encoder),
-        'encoder_ema_state_dict': encoder_ema.state_dict(),
+        'encoder_ema_state_dict': _unwrap_state_dict(encoder_ema),
         'cnf_state_dict': _unwrap_state_dict(cnf),
         'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
         'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
