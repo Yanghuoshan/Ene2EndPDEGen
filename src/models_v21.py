@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sre.siren import SIRENRenderer
+from src.siren import SIRENRenderer
 
 
 def modulate(x, shift, scale):
@@ -396,7 +396,7 @@ class FullModel_v21(nn.Module):
                 node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2
             )
             print("Using Gabor Renderer")
-            
+
     def forward(self, x_noisy, t, input_coords, query_coords, input_node_type=None, query_node_type=None):
         # 1. Encode coordinates
         input_coords_encoded = self.coord_encoder(input_coords)
