@@ -355,9 +355,17 @@ class ShallowWaterChunkDataset(IterableDataset):
             
         self.sim_indices = list(range(self.num_sims))
         self.epoch = 0
+        self.use_vo = False
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+
+    def _load_sim_data(self, sim_idx: int):
+        file_path = self.file_paths[sim_idx]
+        with h5py.File(file_path, 'r') as f:
+            vorticity = np.array(f['tasks']['vorticity'], dtype=np.float32)  # [T, N_x, N_y]
+            height = np.array(f['tasks']['height'], dtype=np.float32)        # [T, N_x, N_y]
+            return vorticity, height, None
 
     def _get_worker_info(self):
         info = get_worker_info()
@@ -382,14 +390,11 @@ class ShallowWaterChunkDataset(IterableDataset):
             rng.shuffle(worker_indices)
             
         for sim_idx in worker_indices:
-            file_path = self.file_paths[sim_idx]
-            with h5py.File(file_path, 'r') as f:
-                vorticity = np.array(f['tasks']['vorticity'], dtype=np.float32)  # [T, N_x, N_y]
-                height = np.array(f['tasks']['height'], dtype=np.float32)        # [T, N_x, N_y]
-                
-                # Stack features -> [T, N_x, N_y, 2] -> [T, N_points, 2]
-                fields_sim = np.stack([vorticity, height], axis=-1)
-                fields_sim = fields_sim.reshape(fields_sim.shape[0], -1, fields_sim.shape[-1])
+            vorticity, height, _ = self._load_sim_data(sim_idx)
+            
+            # Stack features -> [T, N_x, N_y, 2] -> [T, N_points, 2]
+            fields_sim = np.stack([vorticity, height], axis=-1)
+            fields_sim = fields_sim.reshape(fields_sim.shape[0], -1, fields_sim.shape[-1])
 
             if fields_sim.shape[0] < self.chunk_size:
                 continue
