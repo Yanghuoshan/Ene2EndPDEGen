@@ -233,6 +233,7 @@ class HyperNetwork_Perceiver_v22(nn.Module):
         coords_encoded = self.coord_encoder(coords) # [B, N, fourier_dim * 2]
         node_features = torch.cat([freq_features, coords_encoded], dim=-1)
         if self.use_node_type and node_type is not None:
+            node_type = node_type.squeeze(-1) # [B, N, 1] -> [B, N]
             node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float() # [B, N, num_node_types]
             node_features = torch.cat([node_features, node_type_emb], dim=-1)
         feat = self.node_proj(node_features) # [B, N, hidden_dim]
@@ -328,6 +329,7 @@ class GaborRenderer_v22(nn.Module):
         # Extract location-specific latent via Cross-Attention
         q = x0
         if self.use_node_type and node_type is not None:
+            node_type = node_type.squeeze(-1) # [B, N, 1] -> [B, N]
             node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float() # [B, N, self.node_type_num]
             q = torch.cat([x0, node_type_emb], dim=-1) # [B, N, coord_dim + self.node_type_num]
         q = self.query_proj(q)
