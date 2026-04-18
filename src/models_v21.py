@@ -104,6 +104,190 @@ class CrossDiTBlock(nn.Module):
         return x
 
 
+class FlashDiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning using Flash Attention.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), 
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        
+        # Init standard zero for adaLN outputs (forces block to act as identity initially)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        # Attention with Modulation
+        norm_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        B, N, C = norm_x.shape
+        qkv = self.qkv(norm_x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.proj(attn_out)
+        
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        
+        # MLP with Modulation
+        norm_x2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x2)
+        return x
+
+
+class FlashCrossDiTBlock(nn.Module):
+    """
+    A cross-attention DiT block with adaLN-Zero conditioning using Flash Attention.
+    Query comes from latent tokens x, key/value comes from node features kv.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_kv = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.kv_proj = nn.Linear(hidden_size, hidden_size * 2)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+        # Zero init keeps residual branch near identity at startup.
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x, kv_input, c):
+        shift_q, scale_q, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+
+        # Cross-attention with adaLN-modulated latent queries.
+        q_norm = modulate(self.norm_q(x), shift_q, scale_q)
+        kv_norm = self.norm_kv(kv_input)
+        
+        B, M, C = q_norm.shape
+        q = self.q_proj(q_norm).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        B, N_kv, C = kv_norm.shape
+        kv = self.kv_proj(kv_norm).reshape(B, N_kv, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(0)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, M, C)
+        attn_out = self.proj(attn_out)
+        
+        x = x + gate_attn.unsqueeze(1) * attn_out
+
+        # MLP branch with adaLN modulation.
+        mlp_in = modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_in)
+        return x
+
+
+class HyperNetwork_Perceiver_Flash(nn.Module):
+    """
+    DiT-style Set Encoder using Flash Attention blocks completely.
+    """
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, encoded_coord_dim=128, use_node_type=False, node_type_dim=16):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.use_node_type = use_node_type
+        self.channel_in = channel_in
+        self.coord_dim = coord_dim
+        self.latent_dim = latent_dim
+        
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        freq_dim = (t_chunk // 2 + 1) * 2 * channel_in
+        self.freq_proj = nn.Sequential(
+            nn.Linear(freq_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        in_dim_node = hidden_dim + encoded_coord_dim + (node_type_dim if use_node_type else 0)
+        self.node_proj = nn.Sequential(
+            nn.Linear(in_dim_node, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, hidden_dim)/math.sqrt(hidden_dim))
+
+        self.cross_blocks = nn.ModuleList([
+            FlashCrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+        ])
+        self.self_blocks = nn.ModuleList([
+            FlashDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+        ])
+        
+        self.final_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+    def forward(self, x_noisy, coords_encoded, t, type_embeds=None):
+        B, T, N, C = x_noisy.shape
+        
+        c = self.time_mlp(t)
+        
+        x_freq = torch.fft.rfft(x_noisy.float(), dim=1, norm="ortho")
+        x_freq_real = torch.view_as_real(x_freq).permute(0, 2, 1, 3, 4).reshape(B, N, -1).type_as(x_noisy)
+        freq_features = self.freq_proj(x_freq_real)
+        
+        if self.use_node_type and type_embeds is not None:
+            node_features = torch.cat([freq_features, coords_encoded, type_embeds], dim=-1)
+        else:
+            node_features = torch.cat([freq_features, coords_encoded], dim=-1)
+            
+        feat = self.node_proj(node_features)
+        
+        q = self.query_tokens.expand(B, -1, -1)
+        latents = q
+        
+        for cross_block, self_block in zip(self.cross_blocks, self.self_blocks):
+            latents = cross_block(latents, feat, c)
+            latents = self_block(latents, c)
+            
+        z_multi = self.final_proj(latents)
+        
+        return z_multi
+
+
 class FourierFeatures(nn.Module):
     def __init__(self, in_features, mapping_size=64, scale=10.0):
         super().__init__()
@@ -222,8 +406,9 @@ class HyperNetwork_Perceiver_v2(nn.Module):
         c = self.time_mlp(t) # [B, hidden_dim]
         
         # 2. Build node features from trajectory and Fourier-encoded coordinates.
-        x_freq = torch.fft.rfft(x_noisy, dim=1, norm="ortho")  # [B, F, N, C]
-        x_freq_real = torch.view_as_real(x_freq).permute(0, 2, 1, 3, 4).reshape(B, N, -1)  # [B, N, F * C * 2]
+        # rfft requires float32, then cast back real part to bfloat16
+        x_freq = torch.fft.rfft(x_noisy.float(), dim=1, norm="ortho")  # [B, F, N, C]
+        x_freq_real = torch.view_as_real(x_freq).permute(0, 2, 1, 3, 4).reshape(B, N, -1).type_as(x_noisy)  # [B, N, F * C * 2]
         freq_features = self.freq_proj(x_freq_real) # [B, N, hidden_dim]
         
         if self.use_node_type and type_embeds is not None:
@@ -350,7 +535,7 @@ class GaborRenderer_v2(nn.Module):
         
         # Reshape to expected sequence shape: [B, F, N, channel_out, 2]
         out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
-        out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4)
+        out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4).float()
         out_freq_complex = torch.view_as_complex(out_freq_real) # [B, F, N, channel_out]
 
         # Convert frequency domain back to time domain
@@ -396,6 +581,180 @@ class FullModel_v21(nn.Module):
                 node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2
             )
             print("Using Gabor Renderer")
+
+    def forward(self, x_noisy, t, input_coords, query_coords, input_node_type=None, query_node_type=None):
+        # 1. Encode coordinates
+        input_coords_encoded = self.coord_encoder(input_coords)
+        query_coords_encoded = self.coord_encoder(query_coords)
+        
+        # 2. Embed node types
+        input_type_embeds = None
+        query_type_embeds = None
+        if self.use_node_type:
+            if input_node_type is not None:
+                input_type_embeds = self.node_type_embed(input_node_type.squeeze(-1).long())
+            if query_node_type is not None:
+                query_type_embeds = self.node_type_embed(query_node_type.squeeze(-1).long())
+                
+        # 3. Encoder extracts latent
+        z_multi = self.encoder(x_noisy, input_coords_encoded, t, input_type_embeds)
+        
+        # 4. Decoder renders predictions
+        out = self.decoder(z_multi, query_coords, query_coords_encoded, query_type_embeds)
+        
+        return out
+
+class AttentionDecoderBlock(nn.Module):
+    """
+    A standard attention block with Cross-Attention followed by Self-Attention and an MLP.
+    Query comes from the encoded coordinates, key/value comes from the latent tokens in Cross-Attention.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+        self.norm_kv = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q_proj_cross = nn.Linear(hidden_size, hidden_size)
+        self.kv_proj_cross = nn.Linear(hidden_size, hidden_size * 2)
+        self.proj_cross = nn.Linear(hidden_size, hidden_size)
+        
+        self.norm_self = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+
+    def forward(self, q, kv):
+        # Cross-attention: query is x (coords), kv is from latent z_multi
+        q_norm = self.norm_q(q)
+        kv_norm = self.norm_kv(kv)
+        
+        B, N, C = q_norm.shape
+        q_c = self.q_proj_cross(q_norm).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        B, M, C = kv_norm.shape
+        kv_c = self.kv_proj_cross(kv_norm).reshape(B, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k_c, v_c = kv_c.unbind(0)
+        
+        attn_out = F.scaled_dot_product_attention(q_c, k_c, v_c)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.proj_cross(attn_out)
+        
+        q = q + attn_out
+
+        # Self-attention using Flash Attention (SDPA)
+        q_norm2 = self.norm_self(q)
+        B, N, C = q_norm2.shape
+        qkv = self.qkv(q_norm2).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q_sa, k_sa, v_sa = qkv.unbind(0)
+        
+        attn_out2 = F.scaled_dot_product_attention(q_sa, k_sa, v_sa)
+        attn_out2 = attn_out2.transpose(1, 2).reshape(B, N, C)
+        attn_out2 = self.proj(attn_out2)
+        
+        q = q + attn_out2
+
+        # MLP branch
+        mlp_in = self.norm_mlp(q)
+        q = q + self.mlp(mlp_in)
+        return q
+
+
+class AttentionRenderer(nn.Module):
+    """
+    Decoder module using stacked Cross-Attention and Self-Attention blocks.
+    The query points and their types (encoded) act as the initial sequence, 
+    cross-attending directly to the latent tokens (z_multi) from the encoder.
+    """
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, node_type_dim=16, encoded_coord_dim=128, num_heads=8):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.channel_out = channel_out
+        self.use_node_type = use_node_type
+        
+        in_dim_query = encoded_coord_dim + (node_type_dim if use_node_type else 0)
+        self.query_proj = nn.Sequential(
+            nn.Linear(in_dim_query, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        ) if latent_dim != hidden_dim else nn.Identity()
+
+        self.blocks = nn.ModuleList([
+            AttentionDecoderBlock(hidden_dim, num_heads) for _ in range(num_layers)
+        ])
+
+        self.freq_dim = (t_chunk // 2 + 1)
+        self.norm_final = nn.LayerNorm(hidden_dim)
+        self.final_linear = nn.Linear(hidden_dim, self.freq_dim * 2 * channel_out)
+
+    def forward(self, z_multi, coords, coords_encoded, type_embeds=None):
+        B, N, _ = coords.shape
+        
+        if self.use_node_type and type_embeds is not None:
+            query_input = torch.cat([coords_encoded, type_embeds], dim=-1)
+        else:
+            query_input = coords_encoded
+            
+        q = self.query_proj(query_input)  # [B, N, hidden_dim]
+        kv = self.latent_proj(z_multi)    # [B, M, hidden_dim]
+        
+        for block in self.blocks:
+            q = block(q, kv)
+            
+        q = self.norm_final(q)
+        out = self.final_linear(q) # [B, N, F * 2 * channel_out]
+        
+        out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
+        out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4).float()
+        out_freq_complex = torch.view_as_complex(out_freq_real) # [B, F, N, channel_out]
+
+        # Convert frequency domain back to time domain
+        out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1, norm="ortho") # [B, T_chunk, N, channel_out]
+        return out
+
+
+class FullModel_Attention(nn.Module):
+    """
+    End-to-End Model containing the HyperNetwork Encoder and an AttentionRenderer Decoder.
+    """
+    def __init__(self, t_chunk=16, channel_in=2, channel_out=2, coord_dim=2, latent_dim=256, 
+                 time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, 
+                 fourier_dim=64, num_layers=4, use_node_type=False, num_node_types=6, node_type_dim=16):
+        super().__init__()
+        self.use_node_type = use_node_type
+        
+        # 1. Shared Feature Extractors
+        self.coord_encoder = FourierFeatures(in_features=coord_dim, mapping_size=fourier_dim)
+        if self.use_node_type:
+            self.node_type_embed = nn.Embedding(num_node_types, node_type_dim)
+            
+        # 2. Sub-modules
+        self.encoder = HyperNetwork_Perceiver_Flash(
+            t_chunk=t_chunk, channel_in=channel_in, coord_dim=coord_dim, latent_dim=latent_dim,
+            time_emb_dim=time_emb_dim, hidden_dim=hidden_dim, num_heads=num_heads, depth=depth, 
+            num_tokens=num_tokens, encoded_coord_dim=fourier_dim*2, use_node_type=use_node_type, 
+            node_type_dim=node_type_dim
+        )
+        
+        self.decoder = AttentionRenderer(
+            latent_dim=latent_dim, coord_dim=coord_dim, t_chunk=t_chunk, channel_out=channel_out, 
+            hidden_dim=hidden_dim, num_layers=num_layers, use_node_type=use_node_type, 
+            node_type_dim=node_type_dim, encoded_coord_dim=fourier_dim*2, num_heads=num_heads
+        )
+        print("Using Attention Renderer")
 
     def forward(self, x_noisy, t, input_coords, query_coords, input_node_type=None, query_node_type=None):
         # 1. Encode coordinates
