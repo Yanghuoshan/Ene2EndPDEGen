@@ -12,9 +12,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from basicutility import ReadInput as ri
-from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
-from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
-from src.models_v2 import GaborRenderer_v2, GaborRenderer_v3, HyperNetwork_Perceiver_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v4, HyperNetwork_Perceiver_v4,HyperNetwork_Perceiver_v5, GaborRenderer_v5
+from src.dataset import TrajectoryChunkDataset
+from src.models_v21 import FullModel_v21
 from src.normalize import Normalizer_ts, compute_dataset_statistics
 
 
@@ -82,15 +81,15 @@ def train(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
-    ENCODER_TYPE = getattr(hp, "encoder_type", "HyperNetwork")
-    RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
+    RENDERER_TYPE = getattr(hp, "renderer_type", "gabor")
+
     EPOCHS = getattr(hp, "epochs", 50)
     BATCH_SIZE = getattr(hp, "batch_size", 32)
     T_SAMPLING = getattr(hp, "t_sampling", "uniform")
     T_BETA_ALPHA = getattr(hp, "t_beta_alpha", 1.0)
     T_BETA_BETA = getattr(hp, "t_beta_beta", 3.0)
-    LR_enc = getattr(hp, "lr_enc", 1e-4)
-    LR_cnf = getattr(hp, "lr_cnf", 1e-4)
+    LR = getattr(hp, "lr", 1e-4)
+
     STRIDE = getattr(hp, "stride", T_CHUNK)
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
     USE_MULTI_GPU = getattr(hp, "use_multi_gpu", False)
@@ -98,13 +97,11 @@ def train(hp):
     SAVE_EVERY_EPOCHS = getattr(hp, "save_every_epochs", 10)
     SAVE_EVERY_STEPS = getattr(hp, "save_every_steps", 0)  # 0 to disable step-level saving
     DISTILL_LAMBDA = getattr(hp, "distill_lambda", 1.0)
-    FREQ_LOSS_LAMBDA = getattr(hp, "freq_loss_lambda", 1.0)
+
     EMA_DECAY = getattr(hp, "ema_decay", 0.999)
     TEACHER_T_DELTA = getattr(hp, "teacher_t_delta", 0.1)
     AUTO_RESUME = getattr(hp, "auto_resume", True)
     RESUME_CHECKPOINT = getattr(hp, "resume_checkpoint", "latest")
-    USE_NODE_TYPE = getattr(hp, "use_node_type", False)
-    INCLUDE_PRESSURE = getattr(hp, "include_pressure", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -123,13 +120,29 @@ def train(hp):
     # 2. Build Dataset & DataLoader
     # (Wrapped in try/except so if dataset path is missing, users know what to edit)
     try:
-        dataset = H5DirectoryChunkDataset(
+        from datasets import load_from_disk
+        import numpy as np
+        
+        full_ds = load_from_disk(DATASET_PATH)
+        total_len = len(full_ds)
+        data_ratio = getattr(hp, "data_ratio", 1.0)
+        
+        sim_indices = list(range(total_len))
+        if data_ratio < 1.0:
+            np.random.seed(42)  # Set seed for reproducibility
+            num_samples = max(1, int(total_len * data_ratio))
+            sim_indices = np.random.choice(total_len, num_samples, replace=False).tolist()
+            sim_indices.sort()
+            print(f"Using {data_ratio*100:.1f}% data: {num_samples}/{total_len} simulations.")
+            
+        dataset = TrajectoryChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
-            stride=STRIDE,
+            use_vo=False,
+            flatten=True,
             mode='train',
-            return_mesh_info=USE_NODE_TYPE,
-            include_pressure=INCLUDE_PRESSURE
+            sim_indices=sim_indices,
+            stride=STRIDE
         )
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
     except Exception as e:
@@ -162,124 +175,29 @@ def train(hp):
     field_normalizer = Normalizer_ts(params=field_params, method=FIELD_METHOD, dim=FIELD_DIM)
 
     # 3. Initialize Unified Architecture
-    if ENCODER_TYPE == "HyperNetwork_FA":
-        print("Using FA-based HyperNetwork")
-        encoder = HyperNetwork_FA(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_AP":
-        print("Using AP-based HyperNetwork")
-        encoder = HyperNetwork_AP(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_ST":
-        print("Using ST-based HyperNetwork")
-        encoder = HyperNetwork_ST(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver":
-        print("Using Perceiver-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v2":
-        print("Using Perceiver_v2-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v2(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v3":
-        print("Using Perceiver_v3-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v3(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v4":
-        print("Using Perceiver_v4-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v4(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-            use_node_type=USE_NODE_TYPE,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
-        print("Using Perceiver_v5-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v5(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-            use_node_type=USE_NODE_TYPE,
-        ).to(device)
-    else:
-        print("Using standard HyperNetwork")
-        # HyperNetwork encodes noisy trajectories -> Z1 | Renderer decodes Z1 + Coords -> predicted trajectories
-        encoder = HyperNetwork(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
+    print("Using FullModel_v21 Architecture")
+    model = FullModel_v21(
+        t_chunk=T_CHUNK,
+        channel_in=C_OUT,
+        channel_out=C_OUT,
+        coord_dim=2,
+        latent_dim=LATENT_DIM,
+        time_emb_dim=256,
+        hidden_dim=HIDDEN_DIM,
+        num_heads=8,
+        depth=DEPTH_ENC,
+        num_tokens=NUM_TOKENS,
+        fourier_dim=64,
+        num_layers=NUM_LAYERS_CNF,
+        renderer_type= RENDERER_TYPE,
+        use_node_type=False
+    ).to(device)
 
-    # EMA teacher keeps a historical weighted average of the online encoder.
-    encoder_ema = copy.deepcopy(encoder).to(device)
-    encoder_ema.eval()
-    for p in encoder_ema.parameters():
+    # EMA teacher keeps a historical weighted average of the online model.
+    model_ema = copy.deepcopy(model).to(device)
+    model_ema.eval()
+    for p in model_ema.parameters():
         p.requires_grad_(False)
-    
-    if RENDERER_TYPE == "GaborRenderer":
-        print("Using MFN-based GaborRenderer")
-        cnf = GaborRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v2":
-        print("Using V2-based GaborRenderer")
-        cnf = GaborRenderer_v2(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v3":
-        print("Using V3-based GaborRenderer")
-        cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v4":
-        print("Using V4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v5":
-        print("Using V5-based GaborRenderer")
-        cnf = GaborRenderer_v5(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
-    else:
-        print("Using standard CNFRenderer")
-        cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
 
     # Optional multi-GPU support via DataParallel
     if USE_MULTI_GPU and device.type == "cuda":
@@ -287,8 +205,7 @@ def train(hp):
         if n_gpu > 1:
             device_ids = _parse_gpu_ids(GPU_IDS_CFG, n_gpu)
             if len(device_ids) > 1:
-                encoder = nn.DataParallel(encoder, device_ids=device_ids)
-                cnf = nn.DataParallel(cnf, device_ids=device_ids)
+                model = nn.DataParallel(model, device_ids=device_ids)
                 print(f"Multi-GPU enabled (DataParallel), device_ids={device_ids}")
             else:
                 print(f"use_multi_gpu=True but valid gpu_ids={device_ids}, fallback to single GPU training")
@@ -296,30 +213,19 @@ def train(hp):
             print("use_multi_gpu=True but less than 2 CUDA devices found, fallback to single GPU training")
     
     # 3.5 Optimizers and Schedulers
-    optimizer_encoder = torch.optim.AdamW(encoder.parameters(), lr=LR_enc, weight_decay=1e-4)
-    optimizer_cnf = torch.optim.AdamW(cnf.parameters(), lr=LR_cnf, weight_decay=1e-4)
+    optimizer_model = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 
     WARMUP_EPOCHS = getattr(hp, "warmup_epochs", max(1, int(EPOCHS * 0.1)))
     MIN_LR = getattr(hp, "min_lr", 1e-6)
     COSINE_EPOCHS = getattr(hp, "cosine_epochs", EPOCHS - WARMUP_EPOCHS)
     
-    # Schedulers for encoder
-    warmup_enc = torch.optim.lr_scheduler.LinearLR(optimizer_encoder, start_factor=0.01, total_iters=WARMUP_EPOCHS)
-    cosine_enc = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_encoder, T_max=COSINE_EPOCHS, eta_min=MIN_LR)
-    constant_enc = torch.optim.lr_scheduler.ConstantLR(optimizer_encoder, factor=MIN_LR / LR_enc, total_iters=EPOCHS)
-    scheduler_encoder = torch.optim.lr_scheduler.SequentialLR(
-        optimizer_encoder, 
-        schedulers=[warmup_enc, cosine_enc, constant_enc], 
-        milestones=[WARMUP_EPOCHS, WARMUP_EPOCHS + COSINE_EPOCHS]
-    )
-
-    # Schedulers for cnf
-    warmup_cnf = torch.optim.lr_scheduler.LinearLR(optimizer_cnf, start_factor=0.01, total_iters=WARMUP_EPOCHS)
-    cosine_cnf = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_cnf, T_max=COSINE_EPOCHS, eta_min=MIN_LR)
-    constant_cnf = torch.optim.lr_scheduler.ConstantLR(optimizer_cnf, factor=MIN_LR / LR_cnf, total_iters=EPOCHS)
-    scheduler_cnf = torch.optim.lr_scheduler.SequentialLR(
-        optimizer_cnf, 
-        schedulers=[warmup_cnf, cosine_cnf, constant_cnf], 
+    # Schedulers for model
+    warmup_model = torch.optim.lr_scheduler.LinearLR(optimizer_model, start_factor=0.01, total_iters=WARMUP_EPOCHS)
+    cosine_model = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_model, T_max=COSINE_EPOCHS, eta_min=MIN_LR)
+    constant_model = torch.optim.lr_scheduler.ConstantLR(optimizer_model, factor=MIN_LR / LR, total_iters=EPOCHS)
+    scheduler_model = torch.optim.lr_scheduler.SequentialLR(
+        optimizer_model, 
+        schedulers=[warmup_model, cosine_model, constant_model], 
         milestones=[WARMUP_EPOCHS, WARMUP_EPOCHS + COSINE_EPOCHS]
     )
 
@@ -337,17 +243,14 @@ def train(hp):
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
 
-        _load_model_state_dict(encoder, ckpt['encoder_state_dict'])
-        _load_model_state_dict(cnf, ckpt['cnf_state_dict'])
-        if 'encoder_ema_state_dict' in ckpt:
-            encoder_ema.load_state_dict(ckpt['encoder_ema_state_dict'])
+        _load_model_state_dict(model, ckpt['model_state_dict'])
+        if 'model_ema_state_dict' in ckpt:
+            model_ema.load_state_dict(ckpt['model_ema_state_dict'])
         else:
-            _load_model_state_dict(encoder_ema, _unwrap_state_dict(encoder))
-            print("Checkpoint has no encoder_ema_state_dict, EMA initialized from online encoder.")
-        optimizer_encoder.load_state_dict(ckpt['optimizer_encoder_state_dict'])
-        optimizer_cnf.load_state_dict(ckpt['optimizer_cnf_state_dict'])
-        scheduler_encoder.load_state_dict(ckpt['scheduler_encoder_state_dict'])
-        scheduler_cnf.load_state_dict(ckpt['scheduler_cnf_state_dict'])
+            _load_model_state_dict(model_ema, _unwrap_state_dict(model))
+            print("Checkpoint has no model_ema_state_dict, EMA initialized from online model.")
+        optimizer_model.load_state_dict(ckpt['optimizer_model_state_dict'])
+        scheduler_model.load_state_dict(ckpt['scheduler_model_state_dict'])
 
         global_step = int(ckpt.get('global_step', 0))
         start_epoch = int(ckpt.get('epoch', 0))
@@ -360,29 +263,19 @@ def train(hp):
     
     epoch_pbar = tqdm(range(start_epoch, EPOCHS), desc="Training Epochs")
     for epoch in epoch_pbar:
-        encoder.train()
-        cnf.train()
-        encoder_ema.eval()
+        model.train()
+        model_ema.eval()
 
         dataset.set_epoch(epoch)
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_distill_loss = 0.0
-        epoch_gnorm_enc = 0.0
-        epoch_gnorm_cnf = 0.0
+        epoch_gnorm_model = 0.0
         
         loss_t_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
         loss_t_counts = { '1.0': 0, '0.75': 0, '0.5': 0, '0.25': 0, '0.0': 0 }
         
-        for step, batch_data in enumerate(dataloader):
-            if USE_NODE_TYPE:
-                coords_batch, mesh_info = batch_data
-                traj_batch = mesh_info['fields']
-                node_type = mesh_info['node_type'].to(device)
-            else:
-                coords_batch, traj_batch = batch_data
-                node_type = None
-
+        for step, (coords_batch, traj_batch) in enumerate(dataloader):
             # coords_batch: [B, N, 2]
             # traj_batch:   [B, T, N, C]
             coords = coords_batch.to(device)
@@ -419,29 +312,19 @@ def train(hp):
             x_noisy_teacher = (1 - t_teacher_expand) * noise + t_teacher_expand * x_real
             
             # ===== B. Forward Pass (End to End) =====
-            optimizer_encoder.zero_grad()
-            optimizer_cnf.zero_grad()
+            optimizer_model.zero_grad()
             
-            # 1. Predict clean dynamic latent Z1 from noisy data and coords 
-            # Note: We pass `coords` and `t` so the network knows where the sensors are and noise-level
-            if USE_NODE_TYPE:
-                z1_pred = encoder(x_noisy, coords, t, node_type) # [B, LATENT_DIM]
-            else:
-                z1_pred = encoder(x_noisy, coords, t) # [B, LATENT_DIM]
+            # Scale t to [0, 1000] for correct frequency ranges in SinusoidalPositionEmbeddings
+            t_scaled = t * 1000.0
+            t_teacher_scaled = t_teacher * 1000.0
+            
+            # Predict clean trajectory 
+            x_pred = model(x_noisy, t_scaled, input_coords=coords, query_coords=coords)
 
             with torch.no_grad():
-                if USE_NODE_TYPE:
-                    z_target = encoder_ema(x_noisy_teacher, coords, t_teacher, node_type).detach()
-                else:
-                    z_target = encoder_ema(x_noisy_teacher, coords, t_teacher).detach()
+                x_target = model_ema(x_noisy_teacher, t_teacher_scaled, input_coords=coords, query_coords=coords).detach()
             
-            # 2. Render trajectory directly using Z1 and spatial coordinates
-            # Target output corresponds to the Clean trajectory
-            if USE_NODE_TYPE:
-                x_pred = cnf(z1_pred, coords, node_type) # [B, T_CHUNK, N, C]
-            else:
-                x_pred = cnf(z1_pred, coords) # [B, T_CHUNK, N, C]
-            # Instead of comparing Z, we directly enforce MSE on the physical fields!
+            # ===== C. Data-Space Supervision =====
             element_loss = F.mse_loss(x_pred, x_real, reduction='none')
             sample_loss = element_loss.reshape(B, -1).mean(dim=1)
             
@@ -452,28 +335,28 @@ def train(hp):
             # dx_real = x_real[:, 1:, :, :] - x_real[:, :-1, :, :]
             # deriv_loss = F.mse_loss(dx_pred, dx_real)
             
-            distill_loss = F.mse_loss(z1_pred, z_target)
+            distill_loss = F.mse_loss(x_pred, x_target)
+            
+            # Dynamic distillation lambda (warm-up over the initial WARMUP_EPOCHS)
+            current_distill_lambda = DISTILL_LAMBDA * min(1.0, epoch / max(1, WARMUP_EPOCHS))
             
             # deriv_lambda = getattr(hp, "deriv_lambda", 1.0)
-            loss = recon_loss + DISTILL_LAMBDA * distill_loss #+ deriv_lambda * deriv_loss
+            loss = recon_loss + current_distill_lambda * distill_loss #+ deriv_lambda * deriv_loss
             
-            # Backprop updates BOTH the HyperNetwork and the CNF at the same time
+            # Backprop updates
             loss.backward()
             
             # Compute gradient norm
-            gnorm_enc = torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=float('inf'))
-            gnorm_cnf = torch.nn.utils.clip_grad_norm_(cnf.parameters(), max_norm=float('inf'))
+            gnorm_model = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
             
-            optimizer_encoder.step()
-            optimizer_cnf.step()
+            optimizer_model.step()
 
-            _ema_update(encoder_ema, encoder, EMA_DECAY)
+            _ema_update(model_ema, model, EMA_DECAY)
             
             epoch_loss += loss.item()
             epoch_recon_loss += recon_loss.item()
             epoch_distill_loss += distill_loss.item()
-            epoch_gnorm_enc += gnorm_enc.item() if isinstance(gnorm_enc, torch.Tensor) else gnorm_enc
-            epoch_gnorm_cnf += gnorm_cnf.item() if isinstance(gnorm_cnf, torch.Tensor) else gnorm_cnf
+            epoch_gnorm_model += gnorm_model.item() if isinstance(gnorm_model, torch.Tensor) else gnorm_model
             
             global_step += 1
             
@@ -483,13 +366,10 @@ def train(hp):
                 torch.save({
                     'epoch': epoch + 1,
                     'global_step': global_step,
-                    'encoder_state_dict': _unwrap_state_dict(encoder),
-                    'encoder_ema_state_dict': encoder_ema.state_dict(),
-                    'cnf_state_dict': _unwrap_state_dict(cnf),
-                    'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
-                    'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
-                    'scheduler_encoder_state_dict': scheduler_encoder.state_dict(),
-                    'scheduler_cnf_state_dict': scheduler_cnf.state_dict(),
+                    'model_state_dict': _unwrap_state_dict(model),
+                    'model_ema_state_dict': model_ema.state_dict(),
+                    'optimizer_model_state_dict': optimizer_model.state_dict(),
+                    'scheduler_model_state_dict': scheduler_model.state_dict(),
                 }, step_ckpt)
             
             # Bin the sample losses based on t value
@@ -517,27 +397,24 @@ def train(hp):
         avg_loss = epoch_loss / (step + 1)
         avg_recon_loss = epoch_recon_loss / (step + 1)
         avg_distill_loss = epoch_distill_loss / (step + 1)
-        avg_gnorm_enc = epoch_gnorm_enc / (step + 1)
-        avg_gnorm_cnf = epoch_gnorm_cnf / (step + 1)
+        avg_gnorm_model = epoch_gnorm_model / (step + 1)
         
         writer.add_scalar('Loss/train_epoch', avg_loss, epoch + 1)
         writer.add_scalar('Loss/recon_epoch', avg_recon_loss, epoch + 1)
         writer.add_scalar('Loss/distill_epoch', avg_distill_loss, epoch + 1)
-        writer.add_scalar('GradNorm/encoder', avg_gnorm_enc, epoch + 1)
-        writer.add_scalar('GradNorm/cnf', avg_gnorm_cnf, epoch + 1)
+        writer.add_scalar('GradNorm/model', avg_gnorm_model, epoch + 1)
         
         # Update epoch progress bar with average loss and grad norms
         epoch_pbar.set_postfix({
             'avg_loss': f"{avg_loss:.4f}",
             'recon': f"{avg_recon_loss:.4f}",
             'distill': f"{avg_distill_loss:.4f}",
-            'g_enc': f"{avg_gnorm_enc:.2f}",
-            'g_cnf': f"{avg_gnorm_cnf:.2f}"
+            'g_model': f"{avg_gnorm_model:.2f}"
         })
         print(
             f"\nEpoch {epoch+1}/{EPOCHS} "
             f"Average Loss: {avg_loss:.6f} | Recon: {avg_recon_loss:.6f} | Distill: {avg_distill_loss:.6f} "
-            f"| GradNorm Enc: {avg_gnorm_enc:.4f} | GradNorm CNF: {avg_gnorm_cnf:.4f}"
+            f"| GradNorm Model: {avg_gnorm_model:.4f}"
         )
         
         # Display the binned t losses and log to tensorboard
@@ -555,10 +432,8 @@ def train(hp):
         print("-" * 60)
         
         # Step schedulers
-        scheduler_encoder.step()
-        scheduler_cnf.step()
-        writer.add_scalar('LR/encoder', optimizer_encoder.param_groups[0]['lr'], epoch + 1)
-        writer.add_scalar('LR/cnf', optimizer_cnf.param_groups[0]['lr'], epoch + 1)
+        scheduler_model.step()
+        writer.add_scalar('LR/model', optimizer_model.param_groups[0]['lr'], epoch + 1)
         
         # Save epoch checkpoint
         if (epoch + 1) % SAVE_EVERY_EPOCHS == 0:
@@ -566,26 +441,20 @@ def train(hp):
             torch.save({
                 'epoch': epoch + 1,
                 'global_step': global_step,
-                'encoder_state_dict': _unwrap_state_dict(encoder),
-                'encoder_ema_state_dict': encoder_ema.state_dict(),
-                'cnf_state_dict': _unwrap_state_dict(cnf),
-                'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
-                'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
-                'scheduler_encoder_state_dict': scheduler_encoder.state_dict(),
-                'scheduler_cnf_state_dict': scheduler_cnf.state_dict(),
+                'model_state_dict': _unwrap_state_dict(model),
+                'model_ema_state_dict': model_ema.state_dict(),
+                'optimizer_model_state_dict': optimizer_model.state_dict(),
+                'scheduler_model_state_dict': scheduler_model.state_dict(),
             }, epoch_ckpt)
     print(f"Training Complete. Saving final checkpoint to {SAVE_PATH}...")
     final_ckpt = os.path.join(SAVE_PATH, "checkpoint_final.pt")
     torch.save({
         'epoch': EPOCHS,
         'global_step': global_step,
-        'encoder_state_dict': _unwrap_state_dict(encoder),
-        'encoder_ema_state_dict': encoder_ema.state_dict(),
-        'cnf_state_dict': _unwrap_state_dict(cnf),
-        'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
-        'optimizer_cnf_state_dict': optimizer_cnf.state_dict(),
-        'scheduler_encoder_state_dict': scheduler_encoder.state_dict(),
-        'scheduler_cnf_state_dict': scheduler_cnf.state_dict(),
+        'model_state_dict': _unwrap_state_dict(model),
+        'model_ema_state_dict': model_ema.state_dict(),
+        'optimizer_model_state_dict': optimizer_model.state_dict(),
+        'scheduler_model_state_dict': scheduler_model.state_dict(),
     }, final_ckpt)
     print(f"Saved final checkpoint to {final_ckpt}")
     writer.close()

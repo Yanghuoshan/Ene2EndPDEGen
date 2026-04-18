@@ -137,6 +137,7 @@ class H5DirectoryChunkDataset(IterableDataset):
         mode: str = "train",
         seed: int = 42,
         return_mesh_info: bool = False,
+        include_pressure: bool = False,
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -150,6 +151,7 @@ class H5DirectoryChunkDataset(IterableDataset):
         self.seed = seed
         self.is_train = mode == "train"
         self.return_mesh_info = return_mesh_info
+        self.include_pressure = include_pressure
         # Keep this True for compatibility with compute_dataset_statistics in normalize.py.
         self.use_vo = True
 
@@ -194,40 +196,44 @@ class H5DirectoryChunkDataset(IterableDataset):
 
     def _extract_uvp(self, h5_file):
         velocity = np.array(h5_file['velocity'], dtype=np.float32)
-        pressure = np.array(h5_file['pressure'], dtype=np.float32)
+        if self.include_pressure:
+            pressure = np.array(h5_file['pressure'], dtype=np.float32)
 
         if velocity.ndim == 2 and velocity.shape[-1] == 2:
             velocity = velocity[None, ...]
         if velocity.ndim != 3 or velocity.shape[-1] != 2:
             raise ValueError(f"velocity must have shape [T, N, 2] or [N, 2], got {velocity.shape}")
 
-        if pressure.ndim == 1:
-            pressure = pressure[None, :]
-        elif pressure.ndim == 3 and pressure.shape[-1] == 1:
-            pressure = pressure[..., 0]
-        elif pressure.ndim == 2:
-            pass
-        else:
-            raise ValueError(f"pressure must have shape [T, N], [T, N, 1], [N] or [N, 1], got {pressure.shape}")
-
-        if pressure.shape[0] != velocity.shape[0]:
-            if pressure.shape[0] == 1 and velocity.shape[0] > 1:
-                pressure = np.repeat(pressure, velocity.shape[0], axis=0)
+        if self.include_pressure:
+            if pressure.ndim == 1:
+                pressure = pressure[None, :]
+            elif pressure.ndim == 3 and pressure.shape[-1] == 1:
+                pressure = pressure[..., 0]
+            elif pressure.ndim == 2:
+                pass
             else:
-                raise ValueError(
-                    f"time length mismatch between velocity and pressure: "
-                    f"{velocity.shape[0]} vs {pressure.shape[0]}"
-                )
+                raise ValueError(f"pressure must have shape [T, N], [T, N, 1], [N] or [N, 1], got {pressure.shape}")
 
-        if pressure.shape[1] != velocity.shape[1]:
-            raise ValueError(
-                f"node count mismatch between velocity and pressure: "
-                f"{velocity.shape[1]} vs {pressure.shape[1]}"
-            )
+            if pressure.shape[0] != velocity.shape[0]:
+                if pressure.shape[0] == 1 and velocity.shape[0] > 1:
+                    pressure = np.repeat(pressure, velocity.shape[0], axis=0)
+                else:
+                    raise ValueError(
+                        f"time length mismatch between velocity and pressure: "
+                        f"{velocity.shape[0]} vs {pressure.shape[0]}"
+                    )
+
+            if pressure.shape[1] != velocity.shape[1]:
+                raise ValueError(
+                    f"node count mismatch between velocity and pressure: "
+                    f"{velocity.shape[1]} vs {pressure.shape[1]}"
+                )
+            p = pressure
+        else:
+            p = None
 
         u = velocity[..., 0]
         v = velocity[..., 1]
-        p = pressure
         return u, v, p
 
     def _load_sim_data(self, sim_idx: int):
@@ -265,7 +271,10 @@ class H5DirectoryChunkDataset(IterableDataset):
             coords_sim = self.coords_per_sim[sim_idx] # [N, 2]
             with h5py.File(file_path, 'r') as f:
                 u, v, p = self._extract_uvp(f)
-                fields_sim = np.stack([u, v, p], axis=-1)  # [T, N, 3]
+                if self.include_pressure:
+                    fields_sim = np.stack([u, v, p], axis=-1)  # [T, N, 3]
+                else:
+                    fields_sim = np.stack([u, v], axis=-1)  # [T, N, 2]
 
                 if self.return_mesh_info:
                     cells = np.array(f['cells'], dtype=np.int32)

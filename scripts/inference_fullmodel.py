@@ -4,8 +4,7 @@ import glob
 import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
-from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
-from src.models_v2 import HyperNetwork_Perceiver_v2, GaborRenderer_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v3, HyperNetwork_Perceiver_v4, GaborRenderer_v4, HyperNetwork_Perceiver_v5, GaborRenderer_v5
+from src.models_v21 import FullModel_v21
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -25,8 +24,7 @@ def inference_demo(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
-    ENCODER_TYPE = getattr(hp, "encoder_type", "HyperNetwork")
-    RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
+    RENDERER_TYPE = getattr(hp, "renderer_type", "gabor")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
     
     # Normalizer configs
@@ -39,12 +37,27 @@ def inference_demo(hp):
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
 
     try:
+        from datasets import load_from_disk
+        import numpy as np
+
+        full_ds = load_from_disk(DATASET_PATH)
+        total_len = len(full_ds)
+        data_ratio = getattr(hp, "data_ratio", 1.0)
+        
+        sim_indices = list(range(total_len))
+        if data_ratio < 1.0:
+            np.random.seed(42)  # Set seed for reproducibility
+            num_samples = max(1, int(total_len * data_ratio))
+            sim_indices = np.random.choice(total_len, num_samples, replace=False).tolist()
+            sim_indices.sort()
+            
         dataset = TrajectoryChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             use_vo=False,
             flatten=True,
-            mode='test' # or train
+            mode='test', # or train
+            sim_indices=sim_indices
         )
         # coords shape is [N, 2]
         original_coords = dataset.coords.unsqueeze(0).to(device) # expand to [1, N, 2]
@@ -66,117 +79,23 @@ def inference_demo(hp):
     field_normalizer = Normalizer_ts(params=field_params, method=FIELD_METHOD, dim=FIELD_DIM)
 
     # Init Models
-    if ENCODER_TYPE == "HyperNetwork_FA":
-        print("Using FA-based HyperNetwork")
-        encoder = HyperNetwork_FA(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_AP":
-        print("Using AP-based HyperNetwork")
-        encoder = HyperNetwork_AP(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_ST":
-        print("Using ST-based HyperNetwork")
-        from src.models import HyperNetwork_ST
-        encoder = HyperNetwork_ST(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver":
-        print("Using Perceiver-based HyperNetwork")
-        from src.models import HyperNetwork_Perceiver
-        encoder = HyperNetwork_Perceiver(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v2":
-        print("Using Perceiver_v2-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v2(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v3":
-        print("Using Perceiver_v3-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v3(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v4":
-        print("Using Perceiver_v4-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v4(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
-        print("Using Perceiver_v5-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v5(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    else:
-        print("Using standard HyperNetwork")
-        encoder = HyperNetwork(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    
-    if RENDERER_TYPE == "GaborRenderer":
-        print("Using MFN-based GaborRenderer")
-        cnf = GaborRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v2":
-        print("Using MFN_v2-based GaborRenderer")
-        cnf = GaborRenderer_v2(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v3":
-        print("Using MFN_v3-based GaborRenderer")
-        cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v4":
-        print("Using MFN_v4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v5":
-        print("Using MFN_v5-based GaborRenderer")
-        cnf = GaborRenderer_v5(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    else:
-        print("Using standard CNFRenderer")
-        cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+    print("Using FullModel_v21 Architecture")
+    model = FullModel_v21(
+        t_chunk=T_CHUNK,
+        channel_in=C_OUT,
+        channel_out=C_OUT,
+        coord_dim=2,
+        latent_dim=LATENT_DIM,
+        time_emb_dim=256,
+        hidden_dim=HIDDEN_DIM,
+        num_heads=8,
+        depth=DEPTH_ENC,
+        num_tokens=NUM_TOKENS,
+        fourier_dim=64,
+        num_layers=NUM_LAYERS_CNF,
+        renderer_type= RENDERER_TYPE,
+        use_node_type=False
+    ).to(device)
     
     # Load trained weights from unified checkpoint format
     final_ckpt_path = os.path.join(SAVE_PATH, "checkpoint_final.pt")
@@ -193,34 +112,21 @@ def inference_demo(hp):
     if ckpt_path is not None:
         print(f"Loading checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if 'encoder_ema_state_dict' in ckpt:
-            encoder.load_state_dict(ckpt['encoder_ema_state_dict'])
-            print("Loaded encoder from encoder_ema_state_dict.")
-        else:
-            encoder.load_state_dict(ckpt['encoder_state_dict'])
-            print("Checkpoint has no EMA encoder, fallback to encoder_state_dict.")
-        cnf.load_state_dict(ckpt['cnf_state_dict'])
+        if 'model_ema_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_ema_state_dict'])
+            print("Loaded model from model_ema_state_dict.")
+        elif 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+            print("Checkpoint has no EMA model, fallback to model_state_dict.")
         print(f"Checkpoint loaded (epoch={ckpt.get('epoch', 'N/A')}, global_step={ckpt.get('global_step', 'N/A')})")
     else:
-        # Backward compatibility for legacy save format
-        encoder_path = os.path.join(SAVE_PATH, "encoder.pth")
-        cnf_path = os.path.join(SAVE_PATH, "cnf.pth")
-        if os.path.exists(encoder_path) and os.path.exists(cnf_path):
-            print("Loading legacy weights: encoder.pth and cnf.pth")
-            encoder.load_state_dict(torch.load(encoder_path, map_location=device, weights_only=True))
-            cnf.load_state_dict(torch.load(cnf_path, map_location=device, weights_only=True))
-        else:
-            print(f"No checkpoint or legacy weights found in {SAVE_PATH}.")
-            return
+        print(f"No checkpoint found in {SAVE_PATH}.")
+        return
             
-    encoder_params = sum(p.numel() for p in encoder.parameters())
-    cnf_params = sum(p.numel() for p in cnf.parameters())
-    print(f"Encoder model parameters: {encoder_params / 1e6:.2f}M ({encoder_params})")
-    print(f"Renderer (CNF) model parameters: {cnf_params / 1e6:.2f}M ({cnf_params})")
-    print(f"Total model parameters: {(encoder_params + cnf_params) / 1e6:.2f}M")
+    model_params = sum(p.numel() for p in model.parameters())
+    print(f"Total model parameters: {(model_params) / 1e6:.2f}M")
     
-    encoder.eval()
-    cnf.eval()
+    model.eval()
     
     with torch.no_grad():
         # 1. Generation begins from PURE NOISE in Data Space
@@ -232,7 +138,9 @@ def inference_demo(hp):
         x_noise = torch.randn(B, T, N, C).to(device)
         
         # 2. We want completely clean data, which corresponds to t=1.0 in our setup
+        # The time step is scaled by 1000.0 for the model's SinusoidalPositionEmbeddings
         t_target = torch.ones(B).to(device)
+        t_scaled = t_target * 1000.0
         
         # 3. We use original dataset coordinates for the noise support 
         coords = original_coords # [B, N, 2]
@@ -240,18 +148,15 @@ def inference_demo(hp):
         # Normalize input coords
         coords_norm = coord_normalizer.normalize(coords)
         
-        # 4. Hyper-Network extracts the dynamic system latent directly
+        # 4. Neural Network extracts the dynamic system latent and renders the field
         # Note: the input noise is already standard normal, coords must be normalized
-        z1_gen = encoder(x_noise, coords_norm, t_target)
-        
-        # 5. Render infinite resolution fields continuously
-        trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
+        trajectory_pred_norm = model(x_noise, t_scaled, input_coords=coords_norm, query_coords=coords_norm) # [1, T_CHUNK, N, C_OUT]
         
         # Denormalize output trajectory to physical space
         trajectory_pred = field_normalizer.denormalize(trajectory_pred_norm)
         
         print(f"Generated clean trajectory shape: {trajectory_pred.shape}")
-        print("Success! One-step generation achieved via integrated CNF & Flow Data-space training.")
+        print("Success! One-step generation achieved via integrated FullModel Data-space training.")
         
         # Save visualization directly after generation
         from matplotlib import pyplot as plt
@@ -282,14 +187,14 @@ def inference_demo(hp):
         title = ax.set_title("Generated Field (time=0)")
         cbar = plt.colorbar(tpc, ax=ax, label="Velocity Magnitude")
 
-        def update(t):
-            data = field[0, t]
+        def update(t_val):
+            data = field[0, t_val]
             if data.ndim == 2 and data.shape[1] > 1:
                 values = np.linalg.norm(data, axis=1)
             else:
                 values = data.squeeze()
             tpc.set_array(values)
-            title.set_text(f"Generated Field (time={t})")
+            title.set_text(f"Generated Field (time={t_val})")
             return tpc, title
 
         ani = animation.FuncAnimation(fig, update, frames=range(frames), interval=80, blit=False)
@@ -399,7 +304,7 @@ def inference_demo(hp):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python -m scripts.inference <config.yml>")
+        print("Usage: python -m scripts.inference_fullmodel <config.yml>")
         sys.exit(1)
         
     hp = ri.basic_input(sys.argv[-1])
