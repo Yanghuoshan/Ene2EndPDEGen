@@ -1,4 +1,4 @@
-from time import time
+import time
 
 
 def display_current_data_time():

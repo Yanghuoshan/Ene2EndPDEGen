@@ -193,12 +193,14 @@ def inference_demo(hp):
     if ckpt_path is not None:
         print(f"Loading checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if 'encoder_ema_state_dict' in ckpt:
-            encoder.load_state_dict(ckpt['encoder_ema_state_dict'])
-            print("Loaded encoder from encoder_ema_state_dict.")
-        else:
-            encoder.load_state_dict(ckpt['encoder_state_dict'])
-            print("Checkpoint has no EMA encoder, fallback to encoder_state_dict.")
+        # if 'encoder_ema_state_dict' in ckpt:
+        #     encoder.load_state_dict(ckpt['encoder_ema_state_dict'])
+        #     print("Loaded encoder from encoder_ema_state_dict.")
+        # else:
+        #     encoder.load_state_dict(ckpt['encoder_state_dict'])
+        #     print("Checkpoint has no EMA encoder, fallback to encoder_state_dict.")
+        encoder.load_state_dict(ckpt['encoder_state_dict'])
+        print("Loaded encoder from encoder_state_dict.")
         cnf.load_state_dict(ckpt['cnf_state_dict'])
         print(f"Checkpoint loaded (epoch={ckpt.get('epoch', 'N/A')}, global_step={ckpt.get('global_step', 'N/A')})")
     else:

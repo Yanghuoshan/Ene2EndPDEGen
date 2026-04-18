@@ -3,9 +3,9 @@ import os
 import glob
 import torch
 from basicutility import ReadInput as ri
-from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
-from src.models import HyperNetwork, HyperNetwork_FA, HyperNetwork_AP, HyperNetwork_ST, HyperNetwork_Perceiver, CNFRenderer, GaborRenderer
-from src.models_v2 import HyperNetwork_Perceiver_v2, GaborRenderer_v2, HyperNetwork_Perceiver_v3, GaborRenderer_v3, HyperNetwork_Perceiver_v4, GaborRenderer_v4, HyperNetwork_Perceiver_v5, GaborRenderer_v5
+from src.dataset import TrajectoryChunkDataset
+from src.models import HyperNetwork, CNFRenderer
+from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -25,11 +25,9 @@ def inference_demo(hp):
     DEPTH_ENC = getattr(hp, "depth_enc", 4)
     NUM_TOKENS = getattr(hp, "num_tokens", 16)
     NUM_LAYERS_CNF = getattr(hp, "num_layers_cnf", 4)
-    STRIDE = getattr(hp, "stride", T_CHUNK)
     ENCODER_TYPE = getattr(hp, "encoder_type", "HyperNetwork")
     RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
-    USE_NODE_TYPE = getattr(hp, "use_node_type", False)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -41,29 +39,15 @@ def inference_demo(hp):
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
 
     try:
-        dataset = H5DirectoryChunkDataset(
+        dataset = TrajectoryChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
-            stride=STRIDE,
-            mode='test', # or train
-            return_mesh_info=True
+            use_vo=False,
+            flatten=True,
+            mode='test' # or train
         )
-        
-        # 允许在配置文件中指定使用哪个 simulation (sim_idx)，如果不指定则默认随机选取一个
-        import random
-        target_sim_idx = getattr(hp, "sim_idx", random.randint(0, dataset.num_sims - 1))
-        print(f"Using dataset simulation index: {target_sim_idx}")
-        dataset.sim_indices = [target_sim_idx]
-
         # coords shape is [N, 2]
-        original_coords_sample, mesh_info = next(iter(dataset))
-        original_coords = original_coords_sample.unsqueeze(0).clone().detach().to(device) # expand to [1, N, 2]
-        cells_tensor = mesh_info['cells']
-        gt_fields_tensor = mesh_info['fields'].unsqueeze(0).clone().detach() # shape [1, T_CHUNK, N, C]
-        if USE_NODE_TYPE:
-            node_type_tensor = mesh_info['node_type'].unsqueeze(0).clone().detach().to(device) # shape [1, N, 1]
-        else:
-            node_type_tensor = None
+        original_coords = dataset.coords.unsqueeze(0).to(device) # expand to [1, N, 2]
     except Exception as e:
         print(f"Failed to load dataset coords: {e}")
         return
@@ -82,89 +66,16 @@ def inference_demo(hp):
     field_normalizer = Normalizer_ts(params=field_params, method=FIELD_METHOD, dim=FIELD_DIM)
 
     # Init Models
-    if ENCODER_TYPE == "HyperNetwork_FA":
-        print("Using FA-based HyperNetwork")
-        encoder = HyperNetwork_FA(
+    if ENCODER_TYPE == "HyperNetwork_Perceiver_v22":
+        print("Using Perceiver_v22-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v22(
             t_chunk=T_CHUNK,
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_AP":
-        print("Using AP-based HyperNetwork")
-        encoder = HyperNetwork_AP(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_ST":
-        print("Using ST-based HyperNetwork")
-        from src.models import HyperNetwork_ST
-        encoder = HyperNetwork_ST(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver":
-        print("Using Perceiver-based HyperNetwork")
-        from src.models import HyperNetwork_Perceiver
-        encoder = HyperNetwork_Perceiver(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v2":
-        print("Using Perceiver_v2-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v2(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v3":
-        print("Using Perceiver_v3-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v3(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v4":
-        print("Using Perceiver_v4-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v4(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-            use_node_type=USE_NODE_TYPE,
-        ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
-        print("Using Perceiver_v5-based HyperNetwork")
-        encoder = HyperNetwork_Perceiver_v5(
-            t_chunk=T_CHUNK,
-            channel_in=C_OUT,
-            latent_dim=LATENT_DIM,
-            hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC,
-            num_tokens=NUM_TOKENS,
-            use_node_type=USE_NODE_TYPE,
+            use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -177,21 +88,17 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
         ).to(device)
     
-    if RENDERER_TYPE == "GaborRenderer":
-        print("Using MFN-based GaborRenderer")
-        cnf = GaborRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v2":
-        print("Using MFN_v2-based GaborRenderer")
-        cnf = GaborRenderer_v2(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v3":
-        print("Using MFN_v3-based GaborRenderer")
-        cnf = GaborRenderer_v3(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v4":
-        print("Using MFN_v4-based GaborRenderer")
-        cnf = GaborRenderer_v4(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_v5":
-        print("Using MFN_v5-based GaborRenderer")
-        cnf = GaborRenderer_v5(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF, use_node_type=USE_NODE_TYPE).to(device)
+    if RENDERER_TYPE == "GaborRenderer_v22":
+        print("Using Perceiver_v22-based GaborRenderer")
+        cnf = GaborRenderer_v22(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF, 
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
@@ -218,7 +125,7 @@ def inference_demo(hp):
         #     encoder.load_state_dict(ckpt['encoder_state_dict'])
         #     print("Checkpoint has no EMA encoder, fallback to encoder_state_dict.")
         encoder.load_state_dict(ckpt['encoder_state_dict'])
-        print("Encoder weights loaded.")
+        print("Loaded encoder from encoder_state_dict.")
         cnf.load_state_dict(ckpt['cnf_state_dict'])
         print(f"Checkpoint loaded (epoch={ckpt.get('epoch', 'N/A')}, global_step={ckpt.get('global_step', 'N/A')})")
     else:
@@ -232,6 +139,12 @@ def inference_demo(hp):
         else:
             print(f"No checkpoint or legacy weights found in {SAVE_PATH}.")
             return
+            
+    encoder_params = sum(p.numel() for p in encoder.parameters())
+    cnf_params = sum(p.numel() for p in cnf.parameters())
+    print(f"Encoder model parameters: {encoder_params / 1e6:.2f}M ({encoder_params})")
+    print(f"Renderer (CNF) model parameters: {cnf_params / 1e6:.2f}M ({cnf_params})")
+    print(f"Total model parameters: {(encoder_params + cnf_params) / 1e6:.2f}M")
     
     encoder.eval()
     cnf.eval()
@@ -246,6 +159,7 @@ def inference_demo(hp):
         x_noise = torch.randn(B, T, N, C).to(device)
         
         # 2. We want completely clean data, which corresponds to t=1.0 in our setup
+        # Wait, the input x_noise is pure noise, so its corresponding t is 0.0 in our setup
         t_target = torch.zeros(B).to(device)
         
         # 3. We use original dataset coordinates for the noise support 
@@ -256,16 +170,10 @@ def inference_demo(hp):
         
         # 4. Hyper-Network extracts the dynamic system latent directly
         # Note: the input noise is already standard normal, coords must be normalized
-        if USE_NODE_TYPE:
-            z1_gen = encoder(x_noise, coords_norm, t_target, node_type_tensor)
-        else:
-            z1_gen = encoder(x_noise, coords_norm, t_target)
+        z1_gen = encoder(x_noise, coords_norm, t_target)
         
         # 5. Render infinite resolution fields continuously
-        if USE_NODE_TYPE:
-            trajectory_pred_norm = cnf(z1_gen, coords_norm, node_type_tensor) # [1, T_CHUNK, N, C_OUT]
-        else:
-            trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
+        trajectory_pred_norm = cnf(z1_gen, coords_norm) # [1, T_CHUNK, N, C_OUT]
         
         # Denormalize output trajectory to physical space
         trajectory_pred = field_normalizer.denormalize(trajectory_pred_norm)
@@ -279,73 +187,38 @@ def inference_demo(hp):
         import matplotlib.tri as mtri
         import numpy as np
 
-        field_pred = trajectory_pred.detach().cpu().numpy()  # [1, T_CHUNK, N, C]
-        field_gt = gt_fields_tensor.cpu().numpy()            # [1, T_CHUNK, N, C]
+        field = trajectory_pred.detach().cpu().numpy()
         coord = coords[0].detach().cpu().numpy()
-        cells = cells_tensor.detach().cpu().numpy()
         
-        frames = field_pred.shape[1]  # T_CHUNK
+        frames = field.shape[1]  # T_CHUNK
+        data0 = field[0, 0]      # first batch, first timestep [N, C]
         
+        if data0.ndim == 2 and data0.shape[1] > 1:
+            values0 = np.linalg.norm(data0, axis=1)
+        else:
+            values0 = data0.squeeze()
+
         x = coord[:, 0]
         y = coord[:, 1]
-        
-        # cells dimensions: [T, N, 3] or [N, 3], we take the first frame's connectivity.
-        if cells.ndim == 3:
-            triangles = cells[0]
-        else:
-            triangles = cells
+        tri = mtri.Triangulation(x, y)
 
-        tri = mtri.Triangulation(x, y, triangles)
-
-        def get_face_values(data):
-            # Compute velocity magnitude ||(u, v)|| from the first two channels.
-            if data.ndim == 2 and data.shape[1] >= 2:
-                values = np.linalg.norm(data[:, :2], axis=1)
-            else:
-                values = np.abs(data.squeeze())
-            # Each triangle gets meant value of its 3 vertices
-            return values[triangles].mean(axis=1)
-
-        face_values0_pred = get_face_values(field_pred[0, 0])
-        face_values0_gt = get_face_values(field_gt[0, 0])
-        
-        fig, (ax_gt, ax_pred) = plt.subplots(1, 2, figsize=(16, 6))
-
-        # 统一和固定 colorbar 范围可以更好地比较，不过这里我们默认使用单独范围，或随时间自动更新。
-        tpc_gt = ax_gt.tripcolor(tri, facecolors=face_values0_gt, cmap="viridis")
-        ax_gt.triplot(tri, color='black', linewidth=0.2, alpha=0.5)
-        ax_gt.set_aspect('equal')
-        ax_gt.set_xlabel("x")
-        ax_gt.set_ylabel("y")
-        title_gt = ax_gt.set_title("Ground Truth (time=0)")
-        
-        tpc_pred = ax_pred.tripcolor(tri, facecolors=face_values0_pred, cmap="viridis")
-        ax_pred.triplot(tri, color='black', linewidth=0.2, alpha=0.5)
-        ax_pred.set_aspect('equal')
-        ax_pred.set_xlabel("x")
-        ax_pred.set_ylabel("y")
-        title_pred = ax_pred.set_title("Prediction (time=0)")
-
-        # 组合的 colorbar
-        cbar = plt.colorbar(tpc_pred, ax=[ax_gt, ax_pred], fraction=0.03, pad=0.04, label="Velocity Magnitude |(u,v)|")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        tpc = ax.tripcolor(tri, values0, shading="gouraud", cmap="viridis")
+        ax.set_aspect('equal')
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        title = ax.set_title("Generated Field (time=0)")
+        cbar = plt.colorbar(tpc, ax=ax, label="Velocity Magnitude")
 
         def update(t):
-            fv_gt = get_face_values(field_gt[0, t])
-            fv_pred = get_face_values(field_pred[0, t])
-            
-            # 更新颜色
-            tpc_gt.set_array(fv_gt)
-            tpc_pred.set_array(fv_pred)
-            
-            # 动态更新 color limits 使其能够包容两者的最大最小值
-            vmin = min(fv_gt.min(), fv_pred.min())
-            vmax = max(fv_gt.max(), fv_pred.max())
-            tpc_gt.set_clim(vmin, vmax)
-            tpc_pred.set_clim(vmin, vmax)
-            
-            title_gt.set_text(f"Ground Truth (time={t})")
-            title_pred.set_text(f"Prediction (time={t})")
-            return tpc_gt, tpc_pred, title_gt, title_pred
+            data = field[0, t]
+            if data.ndim == 2 and data.shape[1] > 1:
+                values = np.linalg.norm(data, axis=1)
+            else:
+                values = data.squeeze()
+            tpc.set_array(values)
+            title.set_text(f"Generated Field (time={t})")
+            return tpc, title
 
         ani = animation.FuncAnimation(fig, update, frames=range(frames), interval=80, blit=False)
 

@@ -112,12 +112,14 @@ def inference_demo(hp):
     if ckpt_path is not None:
         print(f"Loading checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if 'model_ema_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_ema_state_dict'])
-            print("Loaded model from model_ema_state_dict.")
-        elif 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-            print("Checkpoint has no EMA model, fallback to model_state_dict.")
+        # if 'model_ema_state_dict' in ckpt:
+        #     model.load_state_dict(ckpt['model_ema_state_dict'])
+        #     print("Loaded model from model_ema_state_dict.")
+        # elif 'model_state_dict' in ckpt:
+        #     model.load_state_dict(ckpt['model_state_dict'])
+        #     print("Checkpoint has no EMA model, fallback to model_state_dict.")
+        model.load_state_dict(ckpt['model_state_dict']) # using the main model can be more stable 
+        print("Model weights loaded successfully.")
         print(f"Checkpoint loaded (epoch={ckpt.get('epoch', 'N/A')}, global_step={ckpt.get('global_step', 'N/A')})")
     else:
         print(f"No checkpoint found in {SAVE_PATH}.")
