@@ -14,9 +14,9 @@ from tqdm import tqdm
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
 from src.models import HyperNetwork, CNFRenderer
-from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22
+from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts, compute_dataset_statistics
-from src.utils import display_current_data_time
+from src.utils import *
 
 
 def _unwrap_state_dict(model):
@@ -189,6 +189,17 @@ def train(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v23":
+        print("Using Perceiver_v23-based HyperNetwork with improved time conditioning")
+        encoder = HyperNetwork_Perceiver_v23(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         # HyperNetwork encodes noisy trajectories -> Z1 | Renderer decodes Z1 + Coords -> predicted trajectories
@@ -200,6 +211,8 @@ def train(hp):
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
         ).to(device)
+
+    count_parameters(encoder, name="Encoder")
 
     # EMA teacher keeps a historical weighted average of the online encoder.
     encoder_ema = copy.deepcopy(encoder).to(device)
@@ -218,9 +231,22 @@ def train(hp):
             num_layers=NUM_LAYERS_CNF,
             use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v23":
+        print("Using GaborRenderer_v23 with improved conditioning and stability")
+        cnf = GaborRenderer_v23(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF,
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
     else:
         print("Using standard CNFRenderer")
         cnf = CNFRenderer(latent_dim=LATENT_DIM, coord_dim=2, t_chunk=T_CHUNK, channel_out=C_OUT, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS_CNF).to(device)
+
+    count_parameters(cnf, name="CNF")
 
     # Optional multi-GPU support via DataParallel
     if USE_MULTI_GPU and device.type == "cuda":

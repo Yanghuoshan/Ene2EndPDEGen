@@ -5,7 +5,7 @@ import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
 from src.models import HyperNetwork, CNFRenderer
-from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22
+from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -77,6 +77,17 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v23":
+        print("Using Perceiver_v23-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v23(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -91,6 +102,17 @@ def inference_demo(hp):
     if RENDERER_TYPE == "GaborRenderer_v22":
         print("Using Perceiver_v22-based GaborRenderer")
         cnf = GaborRenderer_v22(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF, 
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v23":
+        print("Using Perceiver_v23-based GaborRenderer")
+        cnf = GaborRenderer_v23(
             latent_dim=LATENT_DIM, 
             coord_dim=2, 
             t_chunk=T_CHUNK, 
@@ -153,7 +175,7 @@ def inference_demo(hp):
         # 1. Generation begins from PURE NOISE in Data Space
         # We match N_points with the actual dataset coordinates
         B, T, N, C = 1, T_CHUNK, original_coords.shape[1], C_OUT
-        seed = time() % 10000  # simple time-based seed for variability
+        seed = time() % 1000  # simple time-based seed for variability
         print(f"Using random seed: {seed:.0f} for noise generation")
         torch.manual_seed(seed)  # for reproducibility
         x_noise = torch.randn(B, T, N, C).to(device)
