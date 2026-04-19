@@ -104,6 +104,7 @@ def train(hp):
     TEACHER_T_DELTA = getattr(hp, "teacher_t_delta", 0.1)
     AUTO_RESUME = getattr(hp, "auto_resume", True)
     RESUME_CHECKPOINT = getattr(hp, "resume_checkpoint", "latest")
+    LOSS_TYPE = getattr(hp, "loss_type", "MSE").upper()
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -366,8 +367,14 @@ def train(hp):
             x_pred = cnf(z1_pred, coords) # [B, T_CHUNK, N, C]
             
             # ===== C. Data-Space Supervision =====
-            # Instead of comparing Z, we directly enforce MSE on the physical fields!
-            element_loss = F.mse_loss(x_pred, x_real, reduction='none')
+            # Instead of comparing Z, we directly enforce the chosen loss on the physical fields!
+            if LOSS_TYPE in ["L1", "MAE"]:
+                element_loss = F.l1_loss(x_pred, x_real, reduction='none')
+            elif LOSS_TYPE == "HUBER":
+                element_loss = F.huber_loss(x_pred, x_real, reduction='none')
+            else:
+                element_loss = F.mse_loss(x_pred, x_real, reduction='none')
+            
             sample_loss = element_loss.reshape(B, -1).mean(dim=1)
             
             recon_loss = sample_loss.mean()
@@ -377,7 +384,12 @@ def train(hp):
             # dx_real = x_real[:, 1:, :, :] - x_real[:, :-1, :, :]
             # deriv_loss = F.mse_loss(dx_pred, dx_real)
             
-            distill_loss = F.mse_loss(z1_pred, z_target)
+            if LOSS_TYPE in ["L1", "MAE"]:
+                distill_loss = F.l1_loss(z1_pred, z_target)
+            elif LOSS_TYPE == "HUBER":
+                distill_loss = F.huber_loss(z1_pred, z_target)
+            else:
+                distill_loss = F.mse_loss(z1_pred, z_target)
             
             # deriv_lambda = getattr(hp, "deriv_lambda", 1.0)
             loss = recon_loss + DISTILL_LAMBDA * distill_loss #+ deriv_lambda * deriv_loss
