@@ -109,8 +109,8 @@ def compute_dataset_statistics(dataset, coord_method='-11', field_method='-11', 
             
             if field_method in ['-11', '01']:
                 if field_dim is None:
-                    d_max = torch.max(fields_flat, dim=0)[0] if field_dim is not None else torch.max(fields_flat)
-                    d_min = torch.min(fields_flat, dim=0)[0] if field_dim is not None else torch.min(fields_flat)
+                    d_max = torch.max(fields_flat)
+                    d_min = torch.min(fields_flat)
                 else:
                     d_max = torch.max(fields_flat, dim=field_dim, keepdim=True)[0]
                     d_min = torch.min(fields_flat, dim=field_dim, keepdim=True)[0]
@@ -122,9 +122,9 @@ def compute_dataset_statistics(dataset, coord_method='-11', field_method='-11', 
                     min_val = torch.min(min_val, d_min)
             elif field_method == 'ms':
                 if field_dim is None:
-                    d_sum = fields_flat.sum(dim=0) if field_dim is not None else fields_flat.sum()
-                    d_sumsq = (fields_flat**2).sum(dim=0) if field_dim is not None else (fields_flat**2).sum()
-                    d_count = fields_flat.shape[0] if field_dim is not None else fields_flat.numel()
+                    d_sum =  fields_flat.sum()
+                    d_sumsq = (fields_flat**2).sum()
+                    d_count = fields_flat.numel()
                 else:
                     d_sum = fields_flat.sum(dim=field_dim, keepdim=True)
                     d_sumsq = (fields_flat**2).sum(dim=field_dim, keepdim=True)
