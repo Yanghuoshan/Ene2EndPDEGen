@@ -98,11 +98,14 @@ def compute_dataset_statistics(dataset, coord_method='-11', field_method='-11', 
         sum_val, sumsq_val, count = None, None, 0
         
         for sim_idx in tqdm(dataset.sim_indices, desc="Scanning dataset"):
-            u, v, vo = dataset._load_sim_data(sim_idx)
-            if dataset.use_vo and vo is not None:
-                fields = np.stack([u, v, vo], axis=-1)
+            if hasattr(dataset, '_load_all_fields'):
+                fields = dataset._load_all_fields(sim_idx)
             else:
-                fields = np.stack([u, v], axis=-1)
+                u, v, vo = dataset._load_sim_data(sim_idx)
+                if getattr(dataset, "use_vo", False) and vo is not None:
+                    fields = np.stack([u, v, vo], axis=-1)
+                else:
+                    fields = np.stack([u, v], axis=-1)
                 
             fields_tensor = torch.tensor(fields, dtype=torch.float32)
             fields_flat = fields_tensor.reshape(-1, fields_tensor.shape[-1])

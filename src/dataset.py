@@ -403,3 +403,136 @@ class ShallowWaterChunkDataset(IterableDataset):
                 chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
                 yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)
 
+
+class MHDChunkDataset(IterableDataset):
+    """
+    Reads MHD h5 files from a directory.
+    Each h5 file is treated as one full trajectory and chunked along its time axis.
+    """
+    def __init__(
+        self,
+        dataset_path: str,
+        chunk_size: int = 16,
+        stride: int = None,
+        mode: str = "train",
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.dataset_path = dataset_path
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+        self.chunk_size = chunk_size
+        self.stride = stride if stride is not None else chunk_size // 2
+        if self.stride <= 0:
+            raise ValueError(f"stride must be > 0, got {self.stride}")
+        self.mode = mode
+        self.seed = seed
+        self.is_train = mode == "train"
+
+        # List all hdf5/h5 files in the directory
+        self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.hdf5"))
+        if not self.file_paths:
+            self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.h5"))
+        self.file_paths.sort()
+        self.num_sims = len(self.file_paths)
+
+        if self.num_sims == 0:
+            raise ValueError(f"No hdf5 files found in {self.dataset_path}")
+
+        # Extract mesh info from the first file
+        with h5py.File(self.file_paths[0], 'r') as f:
+            shape_fields = f['t0_fields']['density'].shape
+            # Assuming shape is (S, T, nx, ny, nz) where S is sample/trajectory index within file
+            if len(shape_fields) == 5:
+                num_samples, T, nx, ny, nz = shape_fields
+            elif len(shape_fields) == 4:
+                # If shape is (T, nx, ny, nz)
+                T, nx, ny, nz = shape_fields
+                num_samples = 1
+            else:
+                raise ValueError("Unexpected shape for density: " + str(shape_fields))
+            
+            # Assuming domain is [0, 1] for all dimensions if not provided
+            x = np.linspace(0, 1, nx, endpoint=False)
+            y = np.linspace(0, 1, ny, endpoint=False)
+            z = np.linspace(0, 1, nz, endpoint=False)
+            
+            X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+            self.coords = torch.tensor(np.stack([X, Y, Z], axis=-1), dtype=torch.float32).reshape(-1, 3)
+            
+            self.traj_len = T
+            
+        self.sim_indices = []
+        for i, p in enumerate(self.file_paths):
+            with h5py.File(p, 'r') as f:
+                s = f['t0_fields']['density'].shape
+                num_s = s[0] if len(s) == 5 else 1
+            for j in range(num_s):
+                self.sim_indices.append((i, j))
+        
+        self.num_sims = len(self.sim_indices)
+        self.epoch = 0
+        self.use_vo = False
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _load_all_fields(self, sim_idx):
+        file_idx, sample_idx = sim_idx
+        density, mg, vel = self._load_sim_data(file_idx, sample_idx)
+        # density is [T, N_x, N_y, N_z], mg and vel are [T, N_x, N_y, N_z, 3]
+        density = density[..., np.newaxis]
+        return np.concatenate([density, mg, vel], axis=-1)
+
+    def _load_sim_data(self, file_idx: int, sample_idx: int):
+        file_path = self.file_paths[file_idx]
+        with h5py.File(file_path, 'r') as f:
+            density = np.array(f['t0_fields']['density'], dtype=np.float32)  # [S, T, ...]
+            magnetic_field = np.array(f['t1_fields']['magnetic_field'], dtype=np.float32)  # [S, T, ..., 3]
+            velocity = np.array(f['t1_fields']['velocity'], dtype=np.float32)  # [S, T, ..., 3]
+            
+            if len(density.shape) == 5: # [S, T, N_x, N_y, N_z]
+                density = density[sample_idx]
+                magnetic_field = magnetic_field[sample_idx]
+                velocity = velocity[sample_idx]
+                
+            return density, magnetic_field, velocity
+
+    def _get_worker_info(self):
+        info = get_worker_info()
+        return (0, 1) if info is None else (info.id, info.num_workers)
+
+    def __iter__(self):
+        worker_id, num_workers = self._get_worker_info()
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+
+        all_indices = np.array(self.sim_indices)
+        if global_num_workers <= 1:
+            worker_indices = all_indices.tolist()
+        else:
+            worker_indices = np.array_split(all_indices, global_num_workers)[global_worker_id].tolist()
+        
+        rng = np.random.default_rng(self.seed + global_worker_id + self.epoch)
+        if self.is_train:
+            rng.shuffle(worker_indices)
+            
+        for file_idx, sample_idx in worker_indices:
+            density, magnetic_field, velocity = self._load_sim_data(file_idx, sample_idx)
+            
+            # density is [T, Nx, Ny, Nz], make it [T, Nx, Ny, Nz, 1]
+            density = density[..., np.newaxis]
+            
+            # Stack features -> [T, Nx, Ny, Nz, 7] -> [T, N_points, 7]
+            fields_sim = np.concatenate([density, magnetic_field, velocity], axis=-1)
+            fields_sim = fields_sim.reshape(fields_sim.shape[0], -1, fields_sim.shape[-1])
+
+            if fields_sim.shape[0] < self.chunk_size:
+                continue
+
+            for t_start in range(0, fields_sim.shape[0] - self.chunk_size + 1, self.stride):
+                chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
+                yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)

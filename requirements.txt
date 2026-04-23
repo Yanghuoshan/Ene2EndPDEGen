@@ -1,7 +1,4 @@
-basicutility==0.0.3
 datasets==4.5.0
 h5py==3.10.0
 matplotlib==3.6.3
-numpy==1.23.5
-torch==2.10.0
 tqdm==4.67.3
