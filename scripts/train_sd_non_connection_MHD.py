@@ -159,6 +159,11 @@ def train(hp):
     os.makedirs(SAVE_PATH, exist_ok=True)
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
     
+    # 开启 TF32 及 cuDNN benchmark 进一步加速并平衡显存
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # Tensorboard writer
     log_dir = os.path.join(SAVE_PATH, "tensorboard_logs")
     writer = SummaryWriter(log_dir=log_dir)
@@ -220,7 +225,9 @@ def train(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
-            use_node_type=False
+            coord_dim=3,
+            use_node_type=False,
+            use_flash_attn=True
         ).to(device)
     elif ENCODER_TYPE == "HyperNetwork_Perceiver_v23":
         print("Using Perceiver_v23-based HyperNetwork with improved time conditioning")
@@ -231,7 +238,9 @@ def train(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
-            use_node_type=False
+            coord_dim=3,
+            use_node_type=False,
+            use_flash_attn=True
         ).to(device)
     else:
         ## Error
@@ -254,7 +263,8 @@ def train(hp):
             channel_out=C_OUT, 
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF,
-            use_node_type=False
+            use_node_type=False,
+            use_flash_attn=True
         ).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v23":
         print("Using GaborRenderer_v23 with improved conditioning and stability")
@@ -265,7 +275,8 @@ def train(hp):
             channel_out=C_OUT, 
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF,
-            use_node_type=False
+            use_node_type=False,
+            use_flash_attn=True
         ).to(device)
     else:
         ## Error
@@ -396,18 +407,25 @@ def train(hp):
             x_real = field_normalizer.normalize(x_real)
 
             # ===== A. Common Setup =====
-            optimizer_encoder.zero_grad()
-            optimizer_cnf.zero_grad()
+            optimizer_encoder.zero_grad(set_to_none=True)
+            optimizer_cnf.zero_grad(set_to_none=True)
             
             # Sample Pure Noise matching physical shape
             noise = torch.randn_like(x_real)
             
-            # --- Random Point Drop for Zero-Shot & Unconditional Support ---
-            N_pts = coords.shape[1]
-            keep_ratio = torch.rand(1).item() * 0.6 + 0.4 # Keep 40% to 100% points
-            M_pts = max(1, int(N_pts * keep_ratio))
+            # --- Fixed Spatial Downsampling OR Full Resolution ---
+            if getattr(hp, "use_downsample", False) and hasattr(dataset, "nx"):
+                factor = getattr(hp, "downsample_factor", 2) # e.g. 2 means X/2, Y/2, Z/2, 4 means X/4...
+                nx, ny, nz = dataset.nx, dataset.ny, dataset.nz
+                idx_x = torch.arange(0, nx, factor, device=device)
+                idx_y = torch.arange(0, ny, factor, device=device)
+                idx_z = torch.arange(0, nz, factor, device=device)
+                grid_x, grid_y, grid_z = torch.meshgrid(idx_x, idx_y, idx_z, indexing='ij')
+                indices = (grid_x * (ny * nz) + grid_y * nz + grid_z).reshape(-1)
+            else:
+                N_pts = coords.shape[1]
+                indices = torch.arange(N_pts, device=device)
             
-            indices = torch.randperm(N_pts)[:M_pts].to(device)
             coords_obs = coords[:, indices, :]
             coords_query = coords
             
@@ -437,11 +455,14 @@ def train(hp):
                 c_in = 1.0 / torch.sqrt(sigma**2 + sigma_data**2) # Pre-conditioning
                 
                 # 1. Predict clean dynamic latent Z1 from noisy data and coords 
-                z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
 
-                # 2. Render trajectory directly using Z1 and spatial coordinates
-                f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
+                    # 2. Render trajectory directly using Z1 and spatial coordinates
+                    f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
                 
+                f_theta = f_theta.float()
+
                 # ===== C. Data-Space Supervision =====
                 # small_noise_mask1 = (t < T_EPS1).float().view(B, 1, 1, 1)
 
@@ -504,20 +525,24 @@ def train(hp):
                 c_in = 1.0 / torch.sqrt(sigma**2 + sigma_data**2) # Pre-conditioning
                 
                 # 1. Predict clean dynamic latent Z1 from noisy data and coords 
-                z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
 
-                # 2. Render trajectory directly using Z1 and spatial coordinates
-                f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
+                    # 2. Render trajectory directly using Z1 and spatial coordinates
+                    f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
                 
                 # Direct prediction
-                x_pred = f_theta
+                x_pred = f_theta.float()
 
                 with torch.no_grad():
                     c_in_teach = 1.0 / torch.sqrt(t_teacher_expand**2 + sigma_data**2)
-                    z_target = encoder_ema(c_in_teach * x_noisy_teacher_obs, coords_obs, t_teacher).detach()
-                    f_theta_teacher = cnf_ema(z_target, coords_query).detach()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        z_target = encoder_ema(c_in_teach * x_noisy_teacher_obs, coords_obs, t_teacher).detach()
+                        f_theta_teacher = cnf_ema(z_target, coords_query).detach()
                     
-                    x_pred_teacher = f_theta_teacher
+                    x_pred_teacher = f_theta_teacher.float()
+
+                f_theta = f_theta.float()
 
                 # ===== C. Data-Space Supervision =====
                 loss_weight = 1.0 / torch.sqrt(t ** 2 + sigma_data**2) # Higher weight for smaller t, similar to EDM's weighting strategy, shape: [B]
@@ -632,6 +657,11 @@ def train(hp):
                     loss_t_counts['0.0'] += 1
 
             # Remove inner pbar postfix update
+            
+            # 手动释放大显存张量从而降低峰值显存占用
+            del x_noisy, x_noisy_obs, coords_obs, coords_query, z1_pred, f_theta, loss
+            if epoch >= PHASE1_EPOCHS:
+                del x_noisy_teacher, x_noisy_teacher_obs, x_noisy_query, z_target, f_theta_teacher, x_pred, x_pred_teacher, delta, delta_norm
             
         avg_loss = epoch_loss / (step + 1)
         avg_recon_loss = epoch_recon_loss / max(recon_steps, 1)

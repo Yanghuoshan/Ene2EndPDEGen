@@ -103,6 +103,134 @@ class CrossDiTBlock(nn.Module):
         return x
 
 
+class FlashDiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning using Flash Attention.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), 
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        norm_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        
+        # Flash Attention
+        B, N, C = norm_x.shape
+        qkv = self.qkv_proj(norm_x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        attn_out = self.out_proj(attn_out)
+        
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        
+        norm_x2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x2)
+        return x
+
+
+class FlashCrossDiTBlock(nn.Module):
+    """
+    A cross-attention DiT block with adaLN-Zero conditioning using Flash Attention.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_kv = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x, kv, c):
+        shift_q, scale_q, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+
+        q_input = modulate(self.norm_q(x), shift_q, scale_q)
+        kv_norm = self.norm_kv(kv)
+        
+        B, N_q, C = q_input.shape
+        _, N_kv, _ = kv_norm.shape
+        
+        q = self.q_proj(q_input).view(B, N_q, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.k_proj(kv_norm).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.v_proj(kv_norm).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N_q, C)
+        attn_out = self.out_proj(attn_out)
+        
+        x = x + gate_attn.unsqueeze(1) * attn_out
+
+        mlp_in = modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_in)
+        return x
+
+
+class FlashCrossAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, query, key, value):
+        B, N_q, C = query.shape
+        _, N_kv, _ = key.shape
+        
+        q = self.q_proj(query).view(B, N_q, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.k_proj(key).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.v_proj(value).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N_q, C)
+        attn_out = self.out_proj(attn_out)
+        
+        return attn_out, None
+
+
 class FourierFeatures(nn.Module):
     def __init__(self, in_features, mapping_size=64, scale=10.0):
         super().__init__()
@@ -163,7 +291,7 @@ class HyperNetwork_Perceiver_v22(nn.Module):
     followed by DiT Self-Attention blocks conditioned on diffusion time t.
     When t_chunk is 128, the prediction is worse than t_chunk=16, likely due to the increased difficulty of learning stable Fourier features and attention over longer sequences.
     """
-    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, use_node_type=False):
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, use_node_type=False, use_flash_attn=False):
         super().__init__()
         self.t_chunk = t_chunk
 
@@ -204,12 +332,20 @@ class HyperNetwork_Perceiver_v22(nn.Module):
         self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, hidden_dim)/math.sqrt(hidden_dim))
 
         # Pure Perceiver stack: alternating Cross-Attn and Self-Attn blocks.
-        self.cross_blocks = nn.ModuleList([
-            CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
-        ])
-        self.self_blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads) for _ in range(depth)
-        ])
+        if use_flash_attn:
+            self.cross_blocks = nn.ModuleList([
+                FlashCrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+            self.self_blocks = nn.ModuleList([
+                FlashDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+        else:
+            self.cross_blocks = nn.ModuleList([
+                CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+            self.self_blocks = nn.ModuleList([
+                DiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
         
         # Flat tokens to Z
         self.final_proj = nn.Sequential(
@@ -363,6 +499,125 @@ class GaborRenderer_v22(nn.Module):
         return out
 
 
+class GaborRenderer_v22_alter(nn.Module):
+    """
+    Direct faithful translation of GNAutodecoder_film from the official ConditionalNeuralField repo.
+    Uses an MFN (Multiplicative Filter Network) structure with Gabor layers processing pure geometry 
+    and Linear layers processing the features, modulated by the Latent target Z1 via additive shifting.
+    """
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, use_flash_attn=False):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.channel_out = channel_out
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.use_node_type = use_node_type
+        self.node_type_num = 10 if use_node_type else 0
+        
+        # MFN basis filters processing pure spatial geometry
+        self.filters = nn.ModuleList([
+            FullGaborLayer(
+                in_features=coord_dim, 
+                out_features=hidden_dim, 
+                weight_scale=256.0 / math.sqrt(num_layers + 1), 
+                alpha=6.0 / (num_layers + 1), 
+                beta=1.0
+            ) 
+            for _ in range(num_layers + 1)
+        ])
+        
+        # Backbone processing modulated spatial features
+        self.net1 = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
+        
+        # Modulator projecting Latents to per-layer additive shifts
+        net2_in_dim = latent_dim + self.node_type_num if use_node_type else latent_dim
+        self.net2 = nn.ModuleList(
+            [nn.Linear(net2_in_dim, hidden_dim, bias=False) for _ in range(num_layers + 1)]
+        )
+
+        # Cross-attention to extract coordinate-specific latents
+        self.query_proj = nn.Sequential(
+            nn.Linear(coord_dim + self.node_type_num, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+        if use_flash_attn:
+            self.cross_attn = FlashCrossAttention(embed_dim=latent_dim, num_heads=8)
+        else:
+            self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
+        self.norm_q = nn.LayerNorm(latent_dim)
+        self.norm_kv = nn.LayerNorm(latent_dim)
+
+        # Output layer predicts frequency domain in real format (real+imag per component)
+        self.freq_dim = (t_chunk // 2 + 1)
+        self.final_linear = nn.Linear(hidden_dim, self.freq_dim * 2 * channel_out)
+        
+        # Proper initialization for MFN Linear Backbone
+        for lin in self.net1:
+            in_dim = lin.weight.shape[1]
+            # weight_scale = 1.0 (default for net2 in original repo)
+            lin.weight.data.uniform_(
+                -math.sqrt(1.0 / in_dim),
+                math.sqrt(1.0 / in_dim),
+            )
+            
+        # Proper initialization for MFN FiLM modulators (net2)
+        for lin in self.net2:
+            in_dim = lin.weight.shape[1]
+            # weight_scale = 1.0 (default for net2 in original repo)
+            lin.weight.data.uniform_(
+                -math.sqrt(1.0 / in_dim),
+                math.sqrt(1.0 / in_dim)
+            )
+
+    def forward(self, z_multi, coords, node_type=None):
+        B, N, _ = coords.shape
+        x0 = coords # x0 is [B, N, coord_dim], used for computing geometry basis in filters and as queries in cross-attention
+        
+        # Extract location-specific latent via Cross-Attention
+        q = x0
+        if self.use_node_type and node_type is not None:
+            node_type = node_type.squeeze(-1) # [B, N, 1] -> [B, N]
+            node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float() # [B, N, self.node_type_num]
+            q = torch.cat([x0, node_type_emb], dim=-1) # [B, N, coord_dim + self.node_type_num]
+        q = self.query_proj(q)
+        q = self.norm_q(q)
+        kv = self.norm_kv(z_multi)
+        z, _ = self.cross_attn(q, kv, kv) # z is [B, N, latent_dim]
+        
+        if self.use_node_type and node_type is not None:
+            z = torch.cat([z, node_type_emb], dim=-1) # 直接将node_type特征拼接到隐变量z上
+            
+        # Step 0: Initial layer injection
+        x = self.filters[0](x0) * self.net2[0](z) # [B, N, hidden_dim]
+        
+        # Multiplicative Filter Network Steps
+        for i in range(1, len(self.filters)):
+            basis = self.filters[i](x0) # Compute coordinate geometry basis
+            
+            # Backbone processing (Wx+b) + Latent Modulation (shift)
+            h = self.net1[i - 1](x) + self.net2[i](z)
+            
+            # MFN Multiplication
+            x = basis * h
+            
+        # Final output projection
+        out = self.final_linear(x) # [B, N, F * 2 * channel_out]
+        
+        # Reshape to expected sequence shape: [B, F, N, channel_out, 2]
+        out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
+        out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4)
+        
+        # view_as_complex does not support bfloat16, so we cast to float32 first
+        out_freq_complex = torch.view_as_complex(out_freq_real.to(torch.float32)) # [B, F, N, channel_out]
+
+        # Convert frequency domain back to time domain
+        out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1) # [B, T_chunk, N, channel_out]
+        return out
+
+
 
 
 class TemporalSWT(nn.Module):
@@ -471,7 +726,7 @@ class HyperNetwork_Perceiver_v23(nn.Module):
     Uses Perceiver-IO styled Cross-Attention to query high-dimensional dynamics from N points,
     followed by DiT Self-Attention blocks conditioned on diffusion time t.
     """
-    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=16, depth=4, num_tokens=16, fourier_dim=64, use_node_type=False):
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=16, depth=4, num_tokens=16, fourier_dim=64, use_node_type=False, use_flash_attn=False):
         super().__init__()
         self.t_chunk = t_chunk
 
@@ -514,12 +769,20 @@ class HyperNetwork_Perceiver_v23(nn.Module):
         self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, hidden_dim)/math.sqrt(hidden_dim))
 
         # Pure Perceiver stack: alternating Cross-Attn and Self-Attn blocks.
-        self.cross_blocks = nn.ModuleList([
-            CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
-        ])
-        self.self_blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads) for _ in range(depth)
-        ])
+        if use_flash_attn:
+            self.cross_blocks = nn.ModuleList([
+                FlashCrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+            self.self_blocks = nn.ModuleList([
+                FlashDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+        else:
+            self.cross_blocks = nn.ModuleList([
+                CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+            self.self_blocks = nn.ModuleList([
+                DiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
         
         # Flat tokens to Z
         self.final_proj = nn.Sequential(
@@ -605,7 +868,7 @@ class GaborRenderer_v23(nn.Module):
     Wavelet-based GaborRenderer using 4 separate Multiplicative Filter Networks.
     Generates 4 temporal SWT subbands from lowest to highest frequency with conditional cascade.
     """
-    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False):
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, use_flash_attn=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_out = channel_out
@@ -620,7 +883,10 @@ class GaborRenderer_v23(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, latent_dim)
         )
-        self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=16, batch_first=True)
+        if use_flash_attn:
+            self.cross_attn = FlashCrossAttention(embed_dim=latent_dim, num_heads=16)
+        else:
+            self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=16, batch_first=True)
         self.norm_q = nn.LayerNorm(latent_dim)
         self.norm_kv = nn.LayerNorm(latent_dim)
 

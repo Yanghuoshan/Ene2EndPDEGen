@@ -187,6 +187,7 @@ class H5DirectoryChunkDataset(IterableDataset):
         with h5py.File(self.file_paths[0], 'r') as f:
             u0, v0, p0 = self._extract_uvp(f)
             self.traj_len = int(u0.shape[0])
+            self.shape_t = self.traj_len
 
         # Explicit legacy-compatible attributes for normalize.py
         self.sim_indices = list(range(self.num_sims))
@@ -352,6 +353,7 @@ class ShallowWaterChunkDataset(IterableDataset):
             
             v0 = f['tasks']['vorticity']
             self.traj_len = v0.shape[0]
+            self.shape_t = self.traj_len
             
         self.sim_indices = list(range(self.num_sims))
         self.epoch = 0
@@ -461,6 +463,10 @@ class MHDChunkDataset(IterableDataset):
             self.coords = torch.tensor(np.stack([X, Y, Z], axis=-1), dtype=torch.float32).reshape(-1, 3)
             
             self.traj_len = T
+            self.shape_t = self.traj_len
+            self.nx = nx
+            self.ny = ny
+            self.nz = nz
             
         self.sim_indices = []
         for i, p in enumerate(self.file_paths):
