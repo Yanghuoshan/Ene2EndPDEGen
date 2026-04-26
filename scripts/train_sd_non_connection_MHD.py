@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from basicutility import ReadInput as ri
 from src.dataset import MHDChunkDataset
+from src.siren import SIRENRenderer
 # from src.models import HyperNetwork, CNFRenderer
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts, compute_dataset_statistics
@@ -177,7 +178,8 @@ def train(hp):
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             stride=STRIDE,
-            mode='train'
+            mode='train',
+            downsample_factor=getattr(hp, "downsample_factor", 1) if getattr(hp, "use_downsample", False) else 1
         )
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
         STEPS_PER_EPOCH = _estimate_steps_per_epoch(
@@ -269,6 +271,18 @@ def train(hp):
     elif RENDERER_TYPE == "GaborRenderer_v23":
         print("Using GaborRenderer_v23 with improved conditioning and stability")
         cnf = GaborRenderer_v23(
+            latent_dim=LATENT_DIM, 
+            coord_dim=3, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF,
+            use_node_type=False,
+            use_flash_attn=True
+        ).to(device)
+    elif RENDERER_TYPE == "SIREN":
+        print("Using SIRENRenderer as a simpler baseline")
+        cnf = SIRENRenderer(
             latent_dim=LATENT_DIM, 
             coord_dim=3, 
             t_chunk=T_CHUNK, 
@@ -413,18 +427,8 @@ def train(hp):
             # Sample Pure Noise matching physical shape
             noise = torch.randn_like(x_real)
             
-            # --- Fixed Spatial Downsampling OR Full Resolution ---
-            if getattr(hp, "use_downsample", False) and hasattr(dataset, "nx"):
-                factor = getattr(hp, "downsample_factor", 2) # e.g. 2 means X/2, Y/2, Z/2, 4 means X/4...
-                nx, ny, nz = dataset.nx, dataset.ny, dataset.nz
-                idx_x = torch.arange(0, nx, factor, device=device)
-                idx_y = torch.arange(0, ny, factor, device=device)
-                idx_z = torch.arange(0, nz, factor, device=device)
-                grid_x, grid_y, grid_z = torch.meshgrid(idx_x, idx_y, idx_z, indexing='ij')
-                indices = (grid_x * (ny * nz) + grid_y * nz + grid_z).reshape(-1)
-            else:
-                N_pts = coords.shape[1]
-                indices = torch.arange(N_pts, device=device)
+            N_pts = coords.shape[1]
+            indices = torch.arange(N_pts, device=device)
             
             coords_obs = coords[:, indices, :]
             coords_query = coords

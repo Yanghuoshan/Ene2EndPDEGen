@@ -874,7 +874,7 @@ class HyperNetwork_Perceiver_v5(nn.Module):
     """
     DiT-style Set Encoder (Data-Space to Latent Z1).
     """
-    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, fno_modes=8, use_fft=False, use_node_type=False):
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, fno_modes=8, use_fft=True, use_node_type=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_in = channel_in
@@ -985,7 +985,7 @@ class GaborRenderer_v5(nn.Module):
     Direct faithful translation of GNAutodecoder_film from the official ConditionalNeuralField repo.
     Uses MFN structure with Gabor layers processing pure geometry.
     """
-    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, fno_modes=8, use_fft=False, use_node_type=False):
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, fno_modes=8, use_fft=True, use_node_type=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_out = channel_out
@@ -1078,13 +1078,281 @@ class GaborRenderer_v5(nn.Module):
 
         # 后处理：频率截断
 
-        out_freq = torch.fft.rfft(out, dim=1, norm="ortho") # [B, F, N, channel_out]
+        # out_freq = torch.fft.rfft(out, dim=1, norm="ortho") # [B, F, N, channel_out]
         
         # Truncation
-        out_freq_trunc = out_freq.clone()
-        if out_freq_trunc.size(1) > 40:
-            out_freq_trunc[:, 40:, ...] = 0
+        # out_freq_trunc = out_freq.clone()
+        # if out_freq_trunc.size(1) > 40:
+        #     out_freq_trunc[:, 40:, ...] = 0
             
-        out = torch.fft.irfft(out_freq_trunc, n=self.t_chunk, dim=1, norm="ortho")
+        # out = torch.fft.irfft(out_freq_trunc, n=self.t_chunk, dim=1, norm="ortho")
+        
+        return out
+
+
+class HyperNetwork_Perceiver_v55(nn.Module):
+    """
+    DiT-style Set Encoder (Data-Space to Latent Z1).
+    """
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=16, fourier_dim=64, fno_modes=8, use_fft=True, use_node_type=False, num_node_types=10, node_type_emb_dim=32):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.channel_in = channel_in
+        self.coord_dim = coord_dim
+        self.latent_dim = latent_dim
+        self.fourier_dim = fourier_dim
+        self.depth = depth
+        self.use_fft = use_fft
+        self.use_node_type = use_node_type
+        self.num_node_types = num_node_types
+        self.node_type_emb_dim = node_type_emb_dim
+        self.node_type_dim = node_type_emb_dim if use_node_type else 0
+
+        if self.use_node_type:
+            self.node_type_embedding = nn.Embedding(num_node_types, node_type_emb_dim)
+            self.node_type_feat_proj = nn.Sequential(
+                nn.Linear(node_type_emb_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.node_type_query_kv = nn.Sequential(
+                nn.Linear(node_type_emb_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.node_type_query_attn = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
+
+        self.coord_encoder = nn.Sequential(
+            nn.Linear(coord_dim + self.node_type_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+        encoded_coord_dim = latent_dim
+        
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        if self.use_fft:
+            freq_dim = (t_chunk // 2 + 1) * 2 * channel_in
+        else:
+            freq_dim = t_chunk * channel_in
+            
+        self.freq_proj = nn.Sequential(
+            nn.Linear(freq_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        self.node_proj = nn.Sequential(
+            nn.Linear(hidden_dim + encoded_coord_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Pre-process node features with self-attention before cross-attending from latents.
+        # self.feat_self_block = DiTBlock(hidden_dim, num_heads)
+        
+        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, hidden_dim)/math.sqrt(hidden_dim))
+
+        self.cross_blocks = nn.ModuleList([
+            CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+        ])
+        self.self_blocks = nn.ModuleList([
+            DiTBlock(hidden_dim, num_heads) for _ in range(depth)
+        ])
+        # self.feat_cross = nn.ModuleList([
+        #     CrossDiTBlock(hidden_dim, num_heads) for _ in range(depth - 1)  # 最后一层不进行特征交叉
+        # ])
+        
+        self.final_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+    def forward(self, x_noisy, coords, t, node_type=None):
+        """
+        x_noisy shape: [B, T, N, C]
+        coords shape: [B, N, coord_dim]
+        """
+        B, T, N, C = x_noisy.shape
+
+        node_type_embed = None
+        if self.use_node_type:
+            if node_type is None:
+                node_type_embed = coords.new_zeros(B, N, self.node_type_emb_dim)
+            else:
+                node_type_ids = node_type.squeeze(-1).long().clamp(0, self.num_node_types - 1)
+                node_type_embed = self.node_type_embedding(node_type_ids)
+            coords_input = torch.cat([coords, node_type_embed], dim=-1)
+        else:
+            coords_input = coords
+        
+        c = self.time_mlp(t)
+        
+        if self.use_fft:
+            x_freq = torch.fft.rfft(x_noisy, dim=1, norm="ortho") # [B, F, N, C]
+            x_freq_real = torch.view_as_real(x_freq).permute(0, 2, 1, 3, 4).reshape(B, N, -1) # [B, N, F * C * 2]
+            freq_features = self.freq_proj(x_freq_real)
+        else:
+            x_time_flat = x_noisy.permute(0, 2, 1, 3).reshape(B, N, -1)
+            freq_features = self.freq_proj(x_time_flat)
+            
+        coords_encoded = self.coord_encoder(coords_input)
+        node_features = torch.cat([freq_features, coords_encoded], dim=-1)
+        feat = self.node_proj(node_features)
+        if self.use_node_type:
+            feat = feat + self.node_type_feat_proj(node_type_embed)
+        # feat = self.feat_self_block(feat, c)
+        
+        q = self.query_tokens.expand(B, -1, -1)
+        if self.use_node_type:
+            # Let each latent token read node-type context independently.
+            type_kv = self.node_type_query_kv(node_type_embed)
+            q_type_delta, _ = self.node_type_query_attn(q, type_kv, type_kv)
+            q = q + q_type_delta
+        latents = q
+        
+        for i in range(self.depth):
+            latents = self.cross_blocks[i](latents, feat, c)
+            latents = self.self_blocks[i](latents, c)
+            # if i < self.depth - 1:   # 不是最后一层
+            #     feat = feat + 0.1 * self.feat_cross[i](feat, latents, c)
+            
+        z_multi = self.final_proj(latents)
+        
+        return z_multi
+
+
+class GaborRenderer_v55(nn.Module):
+    """
+    Direct faithful translation of GNAutodecoder_film from the official ConditionalNeuralField repo.
+    Uses MFN structure with Gabor layers processing pure geometry.
+    """
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, fno_modes=8, use_fft=True, use_node_type=False, num_node_types=10, node_type_emb_dim=32):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.channel_out = channel_out
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.use_fft = use_fft
+        self.use_node_type = use_node_type
+        self.num_node_types = num_node_types
+        self.node_type_emb_dim = node_type_emb_dim
+        self.node_type_dim = node_type_emb_dim if use_node_type else 0
+
+        if self.use_node_type:
+            self.node_type_embedding = nn.Embedding(num_node_types, node_type_emb_dim)
+            self.node_type_z_mod = nn.Sequential(
+                nn.Linear(node_type_emb_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 2 * latent_dim)
+            )
+        
+        self.filters = nn.ModuleList([
+            FullGaborLayer(
+                in_features=coord_dim + self.node_type_dim, 
+                out_features=hidden_dim, 
+                weight_scale=256.0 / math.sqrt(num_layers + 1), 
+                alpha=6.0 / (num_layers + 1), 
+                beta=1.0
+            ) 
+            for _ in range(num_layers + 1)
+        ])
+        
+        self.net1 = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
+        
+        self.net2 = nn.ModuleList(
+            [nn.Linear(latent_dim, hidden_dim, bias=False) for _ in range(num_layers + 1)]
+        )
+
+        self.query_proj = nn.Sequential(
+            nn.Linear(coord_dim + self.node_type_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+        self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
+        self.norm_q = nn.LayerNorm(latent_dim)
+        self.norm_kv = nn.LayerNorm(latent_dim)
+
+        if self.use_fft:
+            self.freq_dim = (t_chunk // 2 + 1)
+            out_dim = self.freq_dim * 2 * channel_out
+        else:
+            out_dim = t_chunk * channel_out
+            
+        self.final_linear = nn.Linear(hidden_dim, out_dim)
+        
+        for lin in self.net1:
+            in_dim = lin.weight.shape[1]
+            lin.weight.data.uniform_(
+                -math.sqrt(1.0 / in_dim),
+                math.sqrt(1.0 / in_dim),
+            )
+            
+        for lin in self.net2:
+            in_dim = lin.weight.shape[1]
+            lin.weight.data.uniform_(
+                -math.sqrt(1.0 / in_dim),
+                math.sqrt(1.0 / in_dim)
+            )
+
+    def forward(self, z_multi, coords, node_type=None):
+        B, N, _ = coords.shape
+        node_type_embed = None
+        if self.use_node_type:
+            if node_type is None:
+                node_type_embed = coords.new_zeros(B, N, self.node_type_emb_dim)
+            else:
+                node_type_ids = node_type.squeeze(-1).long().clamp(0, self.num_node_types - 1)
+                node_type_embed = self.node_type_embedding(node_type_ids)
+            x0 = torch.cat([coords, node_type_embed], dim=-1)
+        else:
+            x0 = coords
+        
+        q = self.query_proj(x0)
+        q = self.norm_q(q)
+        kv = self.norm_kv(z_multi)
+        z, _ = self.cross_attn(q, kv, kv)
+        if self.use_node_type:
+            z_scale, z_shift = self.node_type_z_mod(node_type_embed).chunk(2, dim=-1)
+            z = z * (1.0 + z_scale) + z_shift
+        
+        x = self.filters[0](x0) * self.net2[0](z)
+        
+        for i in range(1, len(self.filters)):
+            basis = self.filters[i](x0)
+            h = self.net1[i - 1](x) + self.net2[i](z)
+            x = basis * h
+            
+        out = self.final_linear(x)
+        
+        if self.use_fft:
+            out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
+            out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4)
+            out_freq_complex = torch.view_as_complex(out_freq_real)
+            out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1, norm="ortho") # [B, T_chunk, N, channel_out]
+        else:
+            # Reshape back to [B, T_chunk, N, channel_out]
+            out = out.view(B, N, self.t_chunk, self.channel_out).permute(0, 2, 1, 3)
+
+        # 后处理：频率截断
+
+        # out_freq = torch.fft.rfft(out, dim=1, norm="ortho") # [B, F, N, channel_out]
+        
+        # Truncation
+        # out_freq_trunc = out_freq.clone()
+        # if out_freq_trunc.size(1) > 40:
+        #     out_freq_trunc[:, 40:, ...] = 0
+            
+        # out = torch.fft.irfft(out_freq_trunc, n=self.t_chunk, dim=1, norm="ortho")
         
         return out

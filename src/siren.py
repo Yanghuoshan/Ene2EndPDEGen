@@ -244,15 +244,17 @@ class SIRENAutodecoder_film(nn.Module):
 class SIRENRenderer(nn.Module):
     """
     SIREN-based renderer adapted to support multi-latent cross-attention 
-    and frequency domain output similarly to GaborRenderer_v2.
+    and frequency domain output, matching GaborRenderer_v22 design.
+    Uses coordinate geometry for basis computation and latent modulation via cross-attention.
     """
-    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, node_type_dim=16, encoded_coord_dim=128, nonlinearity='sine'):
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, nonlinearity='sine', use_flash_attn=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_out = channel_out
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.use_node_type = use_node_type
+        self.node_type_num = 10 if use_node_type else 0
 
         self.nl, self.nl_weight_init, self.first_layer_init = NLS_AND_INITS[nonlinearity]
 
@@ -265,13 +267,17 @@ class SIRENRenderer(nn.Module):
             [BatchLinear(latent_dim, hidden_dim, bias=False) for _ in range(num_layers + 1)]
         )
 
-        in_dim_query = encoded_coord_dim + (node_type_dim if use_node_type else 0)
+        # Cross-attention to extract coordinate-specific latents
         self.query_proj = nn.Sequential(
-            nn.Linear(in_dim_query, hidden_dim),
+            nn.Linear(coord_dim + self.node_type_num, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, latent_dim)
         )
-        self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
+        if use_flash_attn:
+            from src.models_v22 import FlashCrossAttention
+            self.cross_attn = FlashCrossAttention(embed_dim=latent_dim, num_heads=8)
+        else:
+            self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
         self.norm_q = nn.LayerNorm(latent_dim)
         self.norm_kv = nn.LayerNorm(latent_dim)
 
@@ -287,20 +293,30 @@ class SIRENRenderer(nn.Module):
             self.net1[0].apply(self.first_layer_init)
             self.net2[0].apply(self.first_layer_init)
 
-    def forward(self, z_multi, coords, coords_encoded, type_embeds=None):
+    def forward(self, z_multi, coords, node_type=None):
+        """
+        Args:
+            z_multi: [B, M, latent_dim] - Multi-latent tokens from encoder
+            coords: [B, N, coord_dim] - Coordinate positions
+            node_type: [B, N, 1] or [B, N] - Optional node type indices
+        
+        Returns:
+            [B, T_chunk, N, channel_out] - Time-domain predictions
+        """
         B, N, _ = coords.shape
         x0 = coords
         
         # Extract location-specific latent via Cross-Attention
-        if self.use_node_type and type_embeds is not None:
-            query_input = torch.cat([coords_encoded, type_embeds], dim=-1)
-        else:
-            query_input = coords_encoded
-            
-        q = self.query_proj(query_input)
+        q = x0
+        if self.use_node_type and node_type is not None:
+            node_type = node_type.squeeze(-1) if node_type.dim() > 2 else node_type  # [B, N, 1] -> [B, N] or [B, N]
+            node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float()  # [B, N, node_type_num]
+            q = torch.cat([x0, node_type_emb], dim=-1)  # [B, N, coord_dim + node_type_num]
+        
+        q = self.query_proj(q)
         q = self.norm_q(q)
         kv = self.norm_kv(z_multi)
-        z, _ = self.cross_attn(q, kv, kv)
+        z, _ = self.cross_attn(q, kv, kv)  # z is [B, N, latent_dim]
         
         x = x0
         for i in range(len(self.net1)):
@@ -312,10 +328,10 @@ class SIRENRenderer(nn.Module):
         # Reshape to expected sequence shape: [B, F, N, channel_out, 2]
         out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
         out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4)
-        out_freq_complex = torch.view_as_complex(out_freq_real) # [B, F, N, channel_out]
+        out_freq_complex = torch.view_as_complex(out_freq_real.to(torch.float32))  # [B, F, N, channel_out]
 
         # Convert frequency domain back to time domain
-        out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1, norm="ortho") # [B, T_chunk, N, channel_out]
+        out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1, norm="ortho")  # [B, T_chunk, N, channel_out]
         return out
 
 

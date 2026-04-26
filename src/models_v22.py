@@ -395,7 +395,7 @@ class GaborRenderer_v22(nn.Module):
     Uses an MFN (Multiplicative Filter Network) structure with Gabor layers processing pure geometry 
     and Linear layers processing the features, modulated by the Latent target Z1 via additive shifting.
     """
-    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False):
+    def __init__(self, latent_dim=256, coord_dim=2, t_chunk=16, channel_out=2, hidden_dim=256, num_layers=4, use_node_type=False, use_flash_attn=False):
         super().__init__()
         self.t_chunk = t_chunk
         self.channel_out = channel_out
@@ -432,7 +432,10 @@ class GaborRenderer_v22(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, latent_dim)
         )
-        self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
+        if use_flash_attn:
+            self.cross_attn = FlashCrossAttention(embed_dim=latent_dim, num_heads=8)
+        else:
+            self.cross_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=8, batch_first=True)
         self.norm_q = nn.LayerNorm(latent_dim)
         self.norm_kv = nn.LayerNorm(latent_dim)
 
@@ -492,7 +495,7 @@ class GaborRenderer_v22(nn.Module):
         # Reshape to expected sequence shape: [B, F, N, channel_out, 2]
         out_freq_real = out.view(B, N, self.freq_dim, self.channel_out, 2)
         out_freq_real = out_freq_real.permute(0, 2, 1, 3, 4)
-        out_freq_complex = torch.view_as_complex(out_freq_real) # [B, F, N, channel_out]
+        out_freq_complex = torch.view_as_complex(out_freq_real.to(torch.float32)) # [B, F, N, channel_out]
 
         # Convert frequency domain back to time domain
         out = torch.fft.irfft(out_freq_complex, n=self.t_chunk, dim=1) # [B, T_chunk, N, channel_out]
@@ -517,7 +520,7 @@ class GaborRenderer_v22_alter(nn.Module):
         # MFN basis filters processing pure spatial geometry
         self.filters = nn.ModuleList([
             FullGaborLayer(
-                in_features=coord_dim, 
+                in_features=coord_dim + (self.node_type_num if use_node_type else 0), 
                 out_features=hidden_dim, 
                 weight_scale=256.0 / math.sqrt(num_layers + 1), 
                 alpha=6.0 / (num_layers + 1), 
@@ -532,9 +535,8 @@ class GaborRenderer_v22_alter(nn.Module):
         )
         
         # Modulator projecting Latents to per-layer additive shifts
-        net2_in_dim = latent_dim + self.node_type_num if use_node_type else latent_dim
         self.net2 = nn.ModuleList(
-            [nn.Linear(net2_in_dim, hidden_dim, bias=False) for _ in range(num_layers + 1)]
+            [nn.Linear(latent_dim, hidden_dim, bias=False) for _ in range(num_layers + 1)]
         )
 
         # Cross-attention to extract coordinate-specific latents
@@ -576,19 +578,17 @@ class GaborRenderer_v22_alter(nn.Module):
         B, N, _ = coords.shape
         x0 = coords # x0 is [B, N, coord_dim], used for computing geometry basis in filters and as queries in cross-attention
         
-        # Extract location-specific latent via Cross-Attention
-        q = x0
+        # Extract location-specific latent via Cross-Attention      
         if self.use_node_type and node_type is not None:
             node_type = node_type.squeeze(-1) # [B, N, 1] -> [B, N]
             node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float() # [B, N, self.node_type_num]
-            q = torch.cat([x0, node_type_emb], dim=-1) # [B, N, coord_dim + self.node_type_num]
+            x0 = torch.cat([x0, node_type_emb], dim=-1) # [B, N, coord_dim + self.node_type_num]
+
+        q = x0
         q = self.query_proj(q)
         q = self.norm_q(q)
         kv = self.norm_kv(z_multi)
         z, _ = self.cross_attn(q, kv, kv) # z is [B, N, latent_dim]
-        
-        if self.use_node_type and node_type is not None:
-            z = torch.cat([z, node_type_emb], dim=-1) # 直接将node_type特征拼接到隐变量z上
             
         # Step 0: Initial layer injection
         x = self.filters[0](x0) * self.net2[0](z) # [B, N, hidden_dim]

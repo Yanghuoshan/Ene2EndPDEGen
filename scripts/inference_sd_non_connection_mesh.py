@@ -5,7 +5,8 @@ import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
 from src.models import HyperNetwork, CNFRenderer
-from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
+from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, GaborRenderer_v22_alter, HyperNetwork_Perceiver_v23, GaborRenderer_v23
+from src.models_v2 import HyperNetwork_Perceiver_v5, GaborRenderer_v5, HyperNetwork_Perceiver_v55, GaborRenderer_v55
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -30,6 +31,8 @@ def inference_demo(hp):
     RENDERER_TYPE = getattr(hp, "renderer_type", "CNFRenderer")
     SAVE_PATH = getattr(hp, "save_path", "saved_models")
     USE_NODE_TYPE = getattr(hp, "use_node_type", False)
+    SHUFFLE_NODE_ORDER = getattr(hp, "shuffle_node_order", True)
+    SHUFFLE_NODE_SEED = getattr(hp, "shuffle_node_seed", None)
     
     # Normalizer configs
     norm_cfg = getattr(hp, "normalizer", {})
@@ -66,6 +69,37 @@ def inference_demo(hp):
             node_type_tensor = mesh_info['node_type'].unsqueeze(0).clone().detach().to(device) # shape [1, N, 1]
         else:
             node_type_tensor = None
+
+        if SHUFFLE_NODE_ORDER:
+            num_nodes = original_coords.shape[1]
+            shuffle_gen = torch.Generator(device="cpu")
+            if SHUFFLE_NODE_SEED is not None:
+                shuffle_gen.manual_seed(int(SHUFFLE_NODE_SEED))
+                print(f"Shuffling node order with fixed seed: {int(SHUFFLE_NODE_SEED)}")
+            else:
+                print("Shuffling node order with random seed.")
+
+            # Keep the same permutation across all node-indexed tensors.
+            perm_cpu = torch.randperm(num_nodes, generator=shuffle_gen)
+            inv_perm_cpu = torch.empty_like(perm_cpu)
+            inv_perm_cpu[perm_cpu] = torch.arange(num_nodes)
+
+            perm_coords = perm_cpu.to(original_coords.device)
+            perm_fields = perm_cpu.to(gt_fields_tensor.device)
+            original_coords = original_coords[:, perm_coords, :]
+            gt_fields_tensor = gt_fields_tensor[:, :, perm_fields, :]
+            if node_type_tensor is not None:
+                perm_node_type = perm_cpu.to(node_type_tensor.device)
+                node_type_tensor = node_type_tensor[:, perm_node_type, :]
+
+            # Remap mesh connectivity so triangles still point to the right shuffled nodes.
+            cells_long = cells_tensor.long()
+            valid_mask = cells_long >= 0
+            remapped_cells = cells_long.clone()
+            remapped_cells[valid_mask] = inv_perm_cpu[cells_long[valid_mask].cpu()].to(remapped_cells.device)
+            cells_tensor = remapped_cells.to(cells_tensor.dtype)
+
+            print(f"Applied node permutation for {num_nodes} nodes. First 10 perm indices: {perm_cpu[:10].tolist()}")
     except Exception as e:
         print(f"Failed to load dataset coords: {e}")
         return
@@ -106,6 +140,28 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=USE_NODE_TYPE
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v5":
+        print("Using Perceiver_v5-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v5(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE
+        ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v55":
+        print("Using Perceiver_v55-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v55(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=USE_NODE_TYPE
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -128,9 +184,42 @@ def inference_demo(hp):
             num_layers=NUM_LAYERS_CNF, 
             use_node_type=USE_NODE_TYPE
         ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v22_alter":
+        print("Using Perceiver_v22-based GaborRenderer_alter")
+        cnf = GaborRenderer_v22_alter(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF, 
+            use_node_type=USE_NODE_TYPE
+        ).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v23":
         print("Using Perceiver_v23-based GaborRenderer")
         cnf = GaborRenderer_v23(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF, 
+            use_node_type=USE_NODE_TYPE
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v5":
+        print("Using Perceiver_v5-based GaborRenderer")
+        cnf = GaborRenderer_v5(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF, 
+            use_node_type=USE_NODE_TYPE
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_v55":
+        print("Using Perceiver_v55-based GaborRenderer")
+        cnf = GaborRenderer_v55(
             latent_dim=LATENT_DIM, 
             coord_dim=2, 
             t_chunk=T_CHUNK, 
@@ -208,12 +297,12 @@ def inference_demo(hp):
             num_steps = 1
             print("Mode: 1-step fast generation")
         else:
-            num_steps = getattr(hp, "num_sampling_steps", 2)
+            num_steps = getattr(hp, "num_sampling_steps", 5)
             print(f"Mode: Multi-step consistency sampling ({num_steps} steps)")
 
         t_max = getattr(hp, "t_max", 80.0)
-        t_min = getattr(hp, "t_min", 0.002)
-        rho = 7.0
+        t_min = getattr(hp, "t_min", 0.003)
+        rho = 3.0
         
         # EDM target timestep schedule (Karras et al. 2022)
         step_indices = torch.arange(num_steps, dtype=torch.float32, device=device)
@@ -361,16 +450,61 @@ def inference_demo(hp):
         print("Computing frequency domain energy spectra...")
         
         # 将张量转为 NumPy [T_CHUNK, N, C]
-        field_np = trajectory_pred.detach().cpu().numpy()[0] 
-        T_len = field_np.shape[0]
-        num_channels = field_np.shape[2]
+        field_pred_np = trajectory_pred.detach().cpu().numpy()[0]
+        field_gt_np = gt_fields_tensor.cpu().numpy()[0]
+        T_len = field_pred_np.shape[0]
+        num_channels = field_pred_np.shape[2]
         
-        fig_freq, ax_freq = plt.subplots(1, 2, figsize=(12, 5))
+        fig_freq, ax_freq = plt.subplots(1, 3, figsize=(18, 5))
+
+        # 0. Pred vs GT total energy comparison over time
+        def compute_energy_curve(field_tnc):
+            # field_tnc: [T, N, C]
+            if field_tnc.shape[2] >= 2:
+                # Kinetic energy proxy from velocity channels (u, v): E = 0.5 * (u^2 + v^2)
+                energy_node = 0.5 * np.sum(field_tnc[:, :, :2] ** 2, axis=2)
+            else:
+                energy_node = 0.5 * np.sum(field_tnc ** 2, axis=2)
+            return np.mean(energy_node, axis=1)
+
+        energy_curve_pred = compute_energy_curve(field_pred_np)
+        energy_curve_gt = compute_energy_curve(field_gt_np)
+        energy_abs_err = np.abs(energy_curve_pred - energy_curve_gt)
+        energy_mae = float(np.mean(energy_abs_err))
+        energy_rel_l2 = float(np.linalg.norm(energy_curve_pred - energy_curve_gt) / (np.linalg.norm(energy_curve_gt) + 1e-12))
+
+        ax_freq[2].plot(np.arange(T_len), energy_curve_gt, marker='x', linestyle='--', label='GT Energy')
+        ax_freq[2].plot(np.arange(T_len), energy_curve_pred, marker='o', linestyle='-', label='Pred Energy')
+        ax_freq[2].fill_between(
+            np.arange(T_len),
+            np.minimum(energy_curve_gt, energy_curve_pred),
+            np.maximum(energy_curve_gt, energy_curve_pred),
+            alpha=0.2,
+            color='gray',
+            label='Abs Diff'
+        )
+        ax_freq[2].set_xlabel('Time step')
+        ax_freq[2].set_ylabel('Average Energy')
+        ax_freq[2].set_title('Pred vs GT Energy (Time Domain)')
+        ax_freq[2].grid(True, ls='--', alpha=0.5)
+        ax_freq[2].legend()
+        ax_freq[2].text(
+            0.02,
+            0.98,
+            f'MAE={energy_mae:.4e}\nRelL2={energy_rel_l2:.4e}',
+            transform=ax_freq[2].transAxes,
+            va='top',
+            ha='left',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+        )
+        print(f'Energy comparison: MAE={energy_mae:.6e}, RelL2={energy_rel_l2:.6e}')
         
         # 1. 时间轴频域能量 (Temporal Frequency Energy)
         # 对时间轴进行 1D FFT [T_CHUNK, N, C]
-        fft_temporal = np.fft.fft(field_np, axis=0) 
-        energy_temporal = np.abs(fft_temporal)**2
+        fft_temporal_pred = np.fft.fft(field_pred_np, axis=0)
+        fft_temporal_gt = np.fft.fft(field_gt_np, axis=0)
+        energy_temporal_pred = np.abs(fft_temporal_pred) ** 2
+        energy_temporal_gt = np.abs(fft_temporal_gt) ** 2
         
         # 计算平均能量并取出正频率部分
         freqs = np.fft.fftfreq(T_len)
@@ -380,16 +514,18 @@ def inference_demo(hp):
         k_temporal = np.arange(1, np.sum(pos_freq_idxs) + 1)
         
         # 仅在 N 维度求平均，保留通道维度 C: 输出形状 [频率数, 通道数]
-        energy_temporal_avg_N = np.mean(energy_temporal, axis=1)[pos_freq_idxs]
+        energy_temporal_avg_pred = np.mean(energy_temporal_pred, axis=1)[pos_freq_idxs]
+        energy_temporal_avg_gt = np.mean(energy_temporal_gt, axis=1)[pos_freq_idxs]
         
         for c in range(num_channels):
-            ax_freq[0].plot(k_temporal, energy_temporal_avg_N[:, c], marker='o', linestyle='-', label=f"Channel {c}")
+            ax_freq[0].plot(k_temporal, energy_temporal_avg_gt[:, c], marker='x', linestyle='--', label=f"GT Ch{c}")
+            ax_freq[0].plot(k_temporal, energy_temporal_avg_pred[:, c], marker='o', linestyle='-', label=f"Pred Ch{c}")
             
         ax_freq[0].set_yscale('log')
         # ax_freq[0].set_xscale('log')
         ax_freq[0].set_xlabel("Temporal Wavenumber ($k$)")
         ax_freq[0].set_ylabel("Average Energy")
-        ax_freq[0].set_title("Temporal Energy Spectrum")
+        ax_freq[0].set_title("Temporal Energy Spectrum (GT vs Pred)")
         ax_freq[0].grid(True, which="both", ls="--", alpha=0.5)
         ax_freq[0].legend()
 
@@ -398,7 +534,8 @@ def inference_demo(hp):
         try:
             from scipy.interpolate import griddata
             
-            data0 = field_np[0] # [N, C]
+            data0_pred = field_pred_np[0] # [N, C]
+            data0_gt = field_gt_np[0] # [N, C]
             x_coords = coord[:, 0]
             y_coords = coord[:, 1]
             
@@ -407,32 +544,41 @@ def inference_demo(hp):
             grid_x, grid_y = np.mgrid[min(x_coords):max(x_coords):complex(0, grid_res), min(y_coords):max(y_coords):complex(0, grid_res)]
             
             for c in range(num_channels):
-                values_sp_c = data0[:, c]
-                grid_z = griddata((x_coords, y_coords), values_sp_c, (grid_x, grid_y), method='linear')
-                grid_z[np.isnan(grid_z)] = 0.0 # 填补 nan
-                
+                values_pred_c = data0_pred[:, c]
+                values_gt_c = data0_gt[:, c]
+
+                grid_pred = griddata((x_coords, y_coords), values_pred_c, (grid_x, grid_y), method='linear')
+                grid_gt = griddata((x_coords, y_coords), values_gt_c, (grid_x, grid_y), method='linear')
+                grid_pred[np.isnan(grid_pred)] = 0.0 # 填补 nan
+                grid_gt[np.isnan(grid_gt)] = 0.0 # 填补 nan
+
                 # 进行 2D FFT 并将其中心化
-                fft2_spatial = np.fft.fft2(grid_z)
-                fft2_spatial_shift = np.fft.fftshift(fft2_spatial)
-                energy_spatial_2d = np.abs(fft2_spatial_shift)**2
-                
+                fft2_spatial_pred = np.fft.fft2(grid_pred)
+                fft2_spatial_gt = np.fft.fft2(grid_gt)
+                energy_spatial_pred_2d = np.abs(np.fft.fftshift(fft2_spatial_pred)) ** 2
+                energy_spatial_gt_2d = np.abs(np.fft.fftshift(fft2_spatial_gt)) ** 2
+
                 # 进行径向平均(Radial average)获得各波数(wavenumber)频段的一维能量谱
-                center_x, center_y = grid_res//2, grid_res//2
-                y_idx, x_idx = np.indices(grid_z.shape)
-                r = np.sqrt((x_idx - center_x)**2 + (y_idx - center_y)**2).astype(int)
-                
-                tbin = np.bincount(r.ravel(), energy_spatial_2d.ravel())
+                center_x, center_y = grid_res // 2, grid_res // 2
+                y_idx, x_idx = np.indices(grid_pred.shape)
+                r = np.sqrt((x_idx - center_x) ** 2 + (y_idx - center_y) ** 2).astype(int)
+
+                tbin_pred = np.bincount(r.ravel(), energy_spatial_pred_2d.ravel())
+                tbin_gt = np.bincount(r.ravel(), energy_spatial_gt_2d.ravel())
                 nr = np.bincount(r.ravel())
-                radialprofile = tbin / np.maximum(nr, 1)
-                
-                k_vals = np.arange(1, len(radialprofile)) # 略去 k=0 的直流分量
-                ax_freq[1].plot(k_vals, radialprofile[1:], marker='.', linestyle='-', label=f"Channel {c}")
+                radialprofile_pred = tbin_pred / np.maximum(nr, 1)
+                radialprofile_gt = tbin_gt / np.maximum(nr, 1)
+
+                max_len = min(len(radialprofile_pred), len(radialprofile_gt))
+                k_vals = np.arange(1, max_len) # 略去 k=0 的直流分量
+                ax_freq[1].plot(k_vals, radialprofile_gt[1:max_len], marker='x', linestyle='--', label=f"GT Ch{c}")
+                ax_freq[1].plot(k_vals, radialprofile_pred[1:max_len], marker='.', linestyle='-', label=f"Pred Ch{c}")
                 
             ax_freq[1].set_yscale('log')
             # ax_freq[1].set_xscale('log')
             ax_freq[1].set_xlabel("Wavenumber ($k$)")
             ax_freq[1].set_ylabel("Energy $E(k)$")
-            ax_freq[1].set_title("Spatial Energy Spectrum (t=0)")
+            ax_freq[1].set_title("Spatial Energy Spectrum (t=0, GT vs Pred)")
             ax_freq[1].grid(True, which="both", ls="--", alpha=0.5)
             ax_freq[1].legend()
         except Exception as e:
