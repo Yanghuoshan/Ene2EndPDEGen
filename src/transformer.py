@@ -133,7 +133,7 @@ class DiTBlock(nn.Module):
     def forward(self, x, c, text_cond = None, mask = None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        if text_cond is not None:
+        if self.use_cross_attn and text_cond is not None:
             x = x + self.cross_attn(self.norm_cross(x), text_cond, mask=mask)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x

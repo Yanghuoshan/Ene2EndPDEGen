@@ -34,8 +34,8 @@ class FullGaborLayer(nn.Module):
 
 class HyperNetwork_GINO(nn.Module):
     """
-    A HyperNetwork using GINO ConditionalEncoder to map mesh data to grid,
-    followed by DiT blocks for denoising, and outputs a flat latent vector.
+    A HyperNetwork mapping mesh data to grid using simple IDW interpolation,
+    followed by DiT blocks and CNN downsampling for compression.
     """
     def __init__(self, 
                  t_chunk=16,
@@ -45,63 +45,24 @@ class HyperNetwork_GINO(nn.Module):
                  hidden_dim=256, 
                  num_heads=8, 
                  depth=4,
-                 gino_config=None,
                  patch_size=2):
         super().__init__()
         self.t_chunk = t_chunk
         self.patch_size = patch_size
         
-        # Transform time sequence to frequency domain
         freq_in_channels = (t_chunk // 2 + 1) * 2 * channel_in
         
-        if gino_config is None:
-            # Provide a default config compatible with ConditionalEncoder
-            gino_config = {
-                "ablate": False,
-                "out_dim": hidden_dim,
-                "encoder": {
-                    "in_channels": freq_in_channels,
-                    "out_channels": hidden_dim,
-                    "gno_coord_dim": coord_dim,
-                    "gno_coord_embed_dim": None,
-                    "gno_radius": 0.05,
-                    "gno_mlp_hidden_layers": [80, 80, 80],
-                    "gno_mlp_non_linearity": torch.nn.functional.gelu,
-                    "gno_transform_type": 'linear',
-                    "gno_use_torch_scatter": True,
-                    "hidden_channels": 64,
-                    "ch_mult": (1, 2, 4),
-                    "num_res_blocks": 2,
-                    "attn_resolutions": (16, ),
-                    "dropout": 0.0,
-                    "resolution": 32,
-                    "z_channels": hidden_dim,
-                    "double_z": False,
-                    "use_open3d": False,
-                    "tanh_out": False
-                }
-            }
-        
-        self.latent_grid_size = 64  # User explicitly requested 64
-        
-        # Override config resolution to match the inherent latent grid size
-        if "encoder" in gino_config:
-            gino_config["encoder"]["resolution"] = self.latent_grid_size
-            # Calculate the output feature map resolution after CNN downsampling
-            ch_mult = gino_config["encoder"].get("ch_mult", (1, 2, 4))
-            num_downsamples = len(ch_mult) - 1
-            self.resolution = self.latent_grid_size // (2 ** num_downsamples)
-        else:
-            self.resolution = self.latent_grid_size // 4 # Default
+        self.latent_grid_size = 64
+        self.resolution = 16  # After downsampling
 
-        # 1. GINO Encoder maps from mesh to grid features (z_channels)
-        self.gino_encoder = ConditionalEncoder(gino_config)
+        # 1. Map input to hidden dim
+        self.input_proj = nn.Linear(freq_in_channels, hidden_dim)
+        
         self.register_buffer("latent_grid", self.get_latent_grid(self.latent_grid_size))
         
         # 2. DiT processing
-        # Replace manual patch, time embeddings, DiTBlocks, unpatchify with transformer.DiT
         self.dit = DiT(
-            input_size=[self.resolution, self.resolution],
+            input_size=[self.latent_grid_size, self.latent_grid_size],
             patch_size=[patch_size, patch_size],
             in_channels=hidden_dim,
             hidden_size=hidden_dim,
@@ -111,10 +72,15 @@ class HyperNetwork_GINO(nn.Module):
             dim=2
         )
 
-        # 3. Final pooling and projection
-        self.final_layer = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, latent_dim)
+        # 3. CNN compression (2 downsamples to go from 64x64 to 16x16)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, latent_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, latent_dim),
+            nn.GELU(),
+            nn.Conv2d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1)
         )
 
         self.null_context = nn.Parameter(torch.zeros(1, 1, self.dit.t_embedder.mlp[2].out_features))
@@ -126,36 +92,48 @@ class HyperNetwork_GINO(nn.Module):
         xx, yy = torch.meshgrid(xx, yy, indexing='ij')
         latent_queries = torch.stack([xx, yy], dim=-1)
         
-        return latent_queries.unsqueeze(0)
+        return latent_queries.view(-1, 2).unsqueeze(0)
+
+    def interpolate_to_grid(self, x_N, coords, grid):
+        B, N, C = x_N.shape
+        M = grid.shape[1]
+        
+        dist = torch.cdist(grid.expand(B, -1, -1), coords)
+        weights, indices = torch.topk(dist, k=3, dim=-1, largest=False)
+        weights = 1.0 / (weights**2 + 1e-8)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        
+        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, C)
+        x_gathered = torch.gather(x_N.unsqueeze(1).expand(-1, M, -1, -1), 2, indices_expanded)
+        
+        x_grid = (x_gathered * weights.unsqueeze(-1)).sum(dim=2)
+        H = int(M**0.5)
+        x_grid = x_grid.transpose(1, 2).reshape(B, C, H, H)
+        return x_grid
 
     def forward(self, x_noisy, coords, t, pad_mask=None):
         B, _, N, C = x_noisy.shape
         
-        # 1. FFT on temporal dynamics: [B, T_chunk, N, C] -> [B, N, F * C * 2]
-        x_freq = torch.fft.rfft(x_noisy, n=self.t_chunk, dim=1, norm="ortho") # [B, F, N, C]
-        x_freq_real = torch.view_as_real(x_freq) # [B, F, N, C, 2]
-        x_noisy_freq = x_freq_real.permute(0, 2, 1, 3, 4).reshape(B, N, -1) # [B, N, freq_in_channels]
+        x_freq = torch.fft.rfft(x_noisy, n=self.t_chunk, dim=1, norm="ortho")
+        x_freq_real = torch.view_as_real(x_freq)
+        x_noisy_freq = x_freq_real.permute(0, 2, 1, 3, 4).reshape(B, N, -1)
         
-        # Encode with GINO: mesh -> grid latents
-        # coords: [B, N, D]
-        grid_latents = self.gino_encoder(x_noisy_freq, input_geom=coords, latent_queries=self.latent_grid, pad_mask=pad_mask)
-        # grid_latents is [B, (H*W), C] -> reshape to [B, C, H, W]
-        grid_latents = grid_latents.transpose(1, 2).reshape(B, -1, self.resolution, self.resolution)
+        # 1. Map to hidden_dim
+        x_hidden = self.input_proj(x_noisy_freq) # [B, N, hidden_dim]
         
-        # DiT processing
-        # DiT expects context. We pass a learnable null context of appropriate size
-        # because the internal y_embedder is nn.Identity() when context_dim is None, 
-        # and it will concat conditionally to make c have length hidden_dim.
+        # 2. Interpolate to 64x64 grid
+        grid_latents = self.interpolate_to_grid(x_hidden, coords, self.latent_grid) # [B, hidden_dim, 64, 64]
+        
+        # 3. DiT processing
         dummy_context = self.null_context.expand(B, 1, -1)
+        x = self.dit(grid_latents, t, dummy_context) # [B, hidden_dim, 64, 64]
         
-        x = self.dit(grid_latents, t, dummy_context) # [B, hidden_dim, H, W]
+        # 4. CNN compression to 16x16
+        z = self.downsample(x) # [B, latent_dim, 16, 16]
         
-        # Return to channels-last for final projection
-        x = x.permute(0, 2, 3, 1) # [B, H, W, hidden_dim]
+        # Permute to channels last if the rest of the code expects [B, H, W, C]
+        z = z.permute(0, 2, 3, 1) # [B, 16, 16, latent_dim]
         
-        # Final projection to target latent dim (e.g. 256, 512, 1024)
-
-        z = self.final_layer(x)
         return z
 
 
