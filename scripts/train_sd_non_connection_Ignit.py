@@ -413,8 +413,8 @@ def train(hp):
             optimizer_encoder.zero_grad()
             optimizer_cnf.zero_grad()
             
-            # Sample Pure Noise matching physical shape
-            noise = torch.randn_like(x_real)
+            # 使用高斯随机场 (GRF) 替代纯白噪声，保持空间连续性，减轻全局池化下的模式崩塌
+            noise = generate_spatial_grf(coords, target_shape=x_real.shape, length_scale=0.15, grid_size=32)
             
             # --- Random Point Drop for Zero-Shot & Unconditional Support ---
             N_pts = coords.shape[1]
