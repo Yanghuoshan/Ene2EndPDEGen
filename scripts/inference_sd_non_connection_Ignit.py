@@ -7,6 +7,7 @@ from src.dataset import IgnitHitDataset
 from src.models import HyperNetwork, CNFRenderer
 from src.siren import SIRENRenderer
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
+from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.normalize import Normalizer_ts
 from src.utils import generate_spatial_grf
 from time import time
