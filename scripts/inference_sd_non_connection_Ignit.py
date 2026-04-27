@@ -8,6 +8,7 @@ from src.models import HyperNetwork, CNFRenderer
 from src.siren import SIRENRenderer
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts
+from src.utils import generate_spatial_grf
 from time import time
 
 def inference_demo(hp):
@@ -218,7 +219,7 @@ def inference_demo(hp):
             num_steps = 1
             print("Mode: 1-step fast generation")
         else:
-            num_steps = getattr(hp, "num_sampling_steps", 5)
+            num_steps = getattr(hp, "num_sampling_steps", 10)
             print(f"Mode: Multi-step consistency sampling ({num_steps} steps)")
 
         t_max = getattr(hp, "t_max", 80.0)
@@ -230,22 +231,12 @@ def inference_demo(hp):
         t_steps = (t_max ** (1 / rho) + step_indices / (max(num_steps - 1, 1)) * (t_min ** (1 / rho) - t_max ** (1 / rho))) ** rho
         t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])  # Append t=0 for the final step condition
         
-        x = torch.randn(B, T, N, C).to(device) * t_max
         coords = original_coords # [B, N, 2]
         coords_norm = coord_normalizer.normalize(coords)
+        x = generate_spatial_grf(coords_norm, target_shape=(B, T, N, C), length_scale=0.15, grid_size=64).to(device) * t_max
         
-        # --- Logical Flaw Fix (Guidance Injection) ---
-        # The encoder globally pools 16384 spatial noise points which averages to ~0, causing 
-        # identical unconditional generation (mode collapse). We must inject the initial state 
-        # condition to break the symmetry and guide the generation.
+        # --- Unconditional Generation ---
         gt_init = None
-        if ground_truth_sample is not None:
-            gt_fields_norm = field_normalizer.normalize(ground_truth_sample)
-            gt_init = gt_fields_norm[:, 0:1, :, :]
-            print("Logical Flaw Fix: Guiding the sequence using the GT initial state.")
-            # Inject condition to the first timestep input noise 
-            # so the first pass has solid spatial features!
-            x[:, 0:1, :, :] = gt_init + torch.randn_like(x[:, 0:1, :, :]) * t_max
         
         print(f"Starting {num_steps}-step consistency sampling loop...")
         for i in range(num_steps):
@@ -268,13 +259,9 @@ def inference_demo(hp):
             # Direct prediction (no skip connection)
             x0_pred = f_theta
             
-            # Reconstruct the conditional initial state explicitly
-            if gt_init is not None:
-                x0_pred[:, 0:1, :, :] = gt_init
-            
             if i < num_steps - 1:
                 # Add noise back to t_next
-                noise = torch.randn_like(x)
+                noise = generate_spatial_grf(coords_norm, target_shape=x.shape, length_scale=0.15, grid_size=64).to(device)
                 # Following Consistency Models: x_{n-1} = x0_pred + sqrt(t_{prev}^2 - t_min^2) * z
                 std = torch.sqrt(torch.clamp(t_next**2 - t_min**2, min=0.0))
                 x = x0_pred + std * noise

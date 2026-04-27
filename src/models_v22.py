@@ -972,3 +972,222 @@ class GaborRenderer_v23(nn.Module):
         out = self.iswt(coeffs)  
         
         return out
+
+
+class SoftPatchCrossDiTBlock(nn.Module):
+    """
+    A cross-attention DiT block that applies a distance-based soft mask to the attention matrix.
+    Tokens only query nodes that are physically near their anchor coordinates.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.norm_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_kv = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.norm_mlp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size)
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        
+        # Learnable distance decay parameter
+        self.gamma = nn.Parameter(torch.tensor([1.0]))
+
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x, kv, c, dist_sq):
+        shift_q, scale_q, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+
+        q_input = modulate(self.norm_q(x), shift_q, scale_q)
+        kv_norm = self.norm_kv(kv)
+        
+        B, N_q, C = q_input.shape
+        _, N_kv, _ = kv_norm.shape
+        
+        q = self.q_proj(q_input).view(B, N_q, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.k_proj(kv_norm).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = self.v_proj(kv_norm).view(B, N_kv, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
+        # Compute additive distance mask: [B, 1, M, N]
+        actual_gamma = F.softplus(self.gamma)
+        attn_mask = -actual_gamma * dist_sq.unsqueeze(1) 
+        
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N_q, C)
+        attn_out = self.out_proj(attn_out)
+        
+        x = x + gate_attn.unsqueeze(1) * attn_out
+
+        mlp_in = modulate(self.norm_mlp(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_in)
+        return x
+
+
+class HyperNetwork_Perceiver_v24(nn.Module):
+    """
+    Distance-Masked Perceiver (Soft Patch).
+    Tokens are assigned physical anchors. Cross-Attention uses a spatial distance mask
+    to force tokens to only aggregate information from their local physical neighborhood,
+    preventing high-frequency/sharp features from being averaged out globally.
+    """
+    def __init__(self, t_chunk=16, channel_in=2, coord_dim=2, latent_dim=256, time_emb_dim=256, hidden_dim=256, num_heads=8, depth=4, num_tokens=512, fourier_dim=64, use_node_type=False, use_flash_attn=True, is_spherical=False):
+        super().__init__()
+        self.t_chunk = t_chunk
+        self.channel_in = channel_in
+        self.coord_dim = coord_dim
+        self.latent_dim = latent_dim
+        self.fourier_dim = fourier_dim
+        self.use_node_type = use_node_type
+        self.is_spherical = is_spherical
+
+        self.node_type_num = 10 if use_node_type else 0
+
+        self.coord_encoder = FourierFeatures(in_features=coord_dim, mapping_size=fourier_dim)
+        encoded_coord_dim = fourier_dim * 2
+        
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_emb_dim),
+            nn.Linear(time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        freq_dim = (t_chunk // 2 + 1) * 2 * channel_in 
+        self.freq_proj = nn.Sequential(
+            nn.Linear(freq_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        self.node_proj = nn.Sequential(
+            nn.Linear(hidden_dim + encoded_coord_dim + self.node_type_num, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # 🌟 NEW: Anchor Coordinates for Tokens
+        # Instead of randomly initializing and letting them collapse, we scatter them evenly.
+        # This acts as a fixed spatial inductive bias for the soft-patch tokens.
+        
+        # Compute how many points per dimension (assuming somewhat uniform aspect ratio)
+        points_per_dim = round(num_tokens ** (1.0 / coord_dim))
+        
+        actual_tokens = points_per_dim ** coord_dim
+        
+        if actual_tokens != num_tokens:
+            # Fallback to random uniform points if we can't neatly form a perfect grid
+            anchors = torch.rand(num_tokens, coord_dim) * 2 - 1
+        else:
+            # Create N-dimensional meshgrid
+            # Offset by half a step to prevent points from lying exactly on the boundaries
+            step = 2.0 / points_per_dim
+            ranges = [torch.linspace(-1 + step/2, 1 - step/2, points_per_dim) for _ in range(coord_dim)]
+            grids = torch.meshgrid(*ranges, indexing='ij')
+            # Flatten grids and stack them to form combinations
+            anchors = torch.stack([g.flatten() for g in grids], dim=-1)
+            
+        # Register as buffer instead of Parameter so it is saved in state_dict but not updated by optimizer
+        self.register_buffer("token_coords", anchors.unsqueeze(0)) # [1, M, coord_dim]
+        
+        # Learnable latent initial states
+        self.query_tokens = nn.Parameter(torch.randn(1, num_tokens, hidden_dim)/math.sqrt(hidden_dim))
+
+        # We MUST use the custom SoftPatch cross attention
+        self.cross_blocks = nn.ModuleList([
+            SoftPatchCrossDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+        ])
+        
+        # Self-Attention remains unchanged
+        if use_flash_attn:
+            self.self_blocks = nn.ModuleList([
+                FlashDiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+        else:
+            self.self_blocks = nn.ModuleList([
+                DiTBlock(hidden_dim, num_heads) for _ in range(depth)
+            ])
+        
+        self.final_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+    def forward(self, x_noisy, coords, t, node_type=None):
+        B, T, N, C = x_noisy.shape
+        
+        c = self.time_mlp(t) 
+        
+        x_freq = torch.fft.rfft(x_noisy, dim=1) 
+        x_freq_real = torch.view_as_real(x_freq).permute(0, 2, 1, 3, 4).reshape(B, N, -1)
+        freq_features = self.freq_proj(x_freq_real)
+        coords_encoded = self.coord_encoder(coords) 
+        node_features = torch.cat([freq_features, coords_encoded], dim=-1)
+        
+        if self.use_node_type and node_type is not None:
+            node_type = node_type.squeeze(-1) 
+            node_type_emb = F.one_hot(node_type, num_classes=self.node_type_num).float() 
+            node_features = torch.cat([node_features, node_type_emb], dim=-1)
+        feat = self.node_proj(node_features) 
+        
+        # 🌟 NEW: Compute Point-to-Token Squared Distance Matrix
+        # token_coords: [1, M, coord_dim]
+        # coords: [B, N, coord_dim]
+        # delta shape: [B, M, N, coord_dim]
+        if self.is_spherical and self.coord_dim == 2:
+            # For spherical coordinates normalized to [-1, 1]:
+            # Convert 2D (lon, lat) back to 3D Cartesian coordinates for accurate spherical distance
+            lon_t = self.token_coords[..., 0] * math.pi
+            lat_t = self.token_coords[..., 1] * (math.pi / 2.0)
+            x_t = torch.cos(lat_t) * torch.cos(lon_t)
+            y_t = torch.cos(lat_t) * torch.sin(lon_t)
+            z_t = torch.sin(lat_t)
+            token_3d = torch.stack([x_t, y_t, z_t], dim=-1) # [1, M, 3]
+            
+            lon_c = coords[..., 0] * math.pi
+            lat_c = coords[..., 1] * (math.pi / 2.0)
+            x_c = torch.cos(lat_c) * torch.cos(lon_c)
+            y_c = torch.cos(lat_c) * torch.sin(lon_c)
+            z_c = torch.sin(lat_c)
+            coords_3d = torch.stack([x_c, y_c, z_c], dim=-1) # [B, N, 3]
+            
+            # 优化：因为点都在单位球面上（范数为1），(A-B)^2 = A^2 + B^2 - 2A*B = 2 - 2A*B
+            # 使用 einsum 进行高效的批量矩阵乘法算点积，避免实例化 [B, M, N, 3] 的庞大张量
+            dot_product = torch.einsum('md,bnd->bmn', token_3d.squeeze(0), coords_3d)
+            dist_sq = 2.0 - 2.0 * dot_product
+            # 防止浮点误差导致负数
+            dist_sq = torch.clamp(dist_sq, min=0.0)
+        else:
+            # 优化：通过展开 (A-B)^2 = A^2 + B^2 - 2AB 避免实例化 [B, M, N, coord_dim] 的临时张量
+            tc_sq = (self.token_coords ** 2).sum(dim=-1).unsqueeze(2) # [1, M, 1]
+            c_sq = (coords ** 2).sum(dim=-1).unsqueeze(1) # [B, 1, N]
+            dot_product = torch.einsum('md,bnd->bmn', self.token_coords.squeeze(0), coords)
+            dist_sq = torch.clamp(tc_sq + c_sq - 2.0 * dot_product, min=0.0)
+        
+        # Initialize token features
+        latents = self.query_tokens.expand(B, -1, -1)  # [B, M, hidden_dim]
+        
+        for cross_block, self_block in zip(self.cross_blocks, self.self_blocks):
+            # Pass the distance squared matrix into cross attention for soft masking
+            latents = cross_block(latents, feat, c, dist_sq)
+            latents = self_block(latents, c)
+            
+        z_multi = self.final_proj(latents) 
+        
+        return z_multi

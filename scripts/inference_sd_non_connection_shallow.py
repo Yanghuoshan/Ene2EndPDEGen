@@ -6,8 +6,9 @@ from basicutility import ReadInput as ri
 from src.dataset import ShallowWaterChunkDataset
 from src.models import HyperNetwork, CNFRenderer
 from src.siren import SIRENRenderer
-from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
+from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23, HyperNetwork_Perceiver_v24
 from src.normalize import Normalizer_ts
+from src.utils import generate_spatial_grf
 from time import time
 
 def inference_demo(hp):
@@ -94,6 +95,17 @@ def inference_demo(hp):
     elif ENCODER_TYPE == "HyperNetwork_Perceiver_v23":
         print("Using Perceiver_v23-based HyperNetwork")
         encoder = HyperNetwork_Perceiver_v23(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            num_tokens=NUM_TOKENS,
+            use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_Perceiver_v24":
+        print("Using Perceiver_v24-based HyperNetwork")
+        encoder = HyperNetwork_Perceiver_v24(
             t_chunk=T_CHUNK,
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
@@ -226,9 +238,9 @@ def inference_demo(hp):
         t_steps = (t_max ** (1 / rho) + step_indices / (max(num_steps - 1, 1)) * (t_min ** (1 / rho) - t_max ** (1 / rho))) ** rho
         t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])  # Append t=0 for the final step condition
         
-        x = torch.randn(B, T, N, C).to(device) * t_max
         coords = original_coords # [B, N, 2]
         coords_norm = coord_normalizer.normalize(coords)
+        x = generate_spatial_grf(coords_norm, target_shape=(B, T, N, C), length_scale=0.15, grid_size=64).to(device) * t_max
         
         print(f"Starting {num_steps}-step consistency sampling loop...")
         for i in range(num_steps):
@@ -253,7 +265,7 @@ def inference_demo(hp):
             
             if i < num_steps - 1:
                 # Add noise back to t_next
-                noise = torch.randn_like(x)
+                noise = generate_spatial_grf(coords_norm, target_shape=x.shape, length_scale=0.15, grid_size=64).to(device)
                 # Following Consistency Models: x_{n-1} = x0_pred + sqrt(t_{prev}^2 - t_min^2) * z
                 std = torch.sqrt(torch.clamp(t_next**2 - t_min**2, min=0.0))
                 x = x0_pred + std * noise
