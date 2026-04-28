@@ -103,8 +103,9 @@ class HyperNetwork_GINO(nn.Module):
         weights = 1.0 / (weights**2 + 1e-8)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, -1, C)
-        x_gathered = torch.gather(x_N.unsqueeze(1).expand(-1, M, -1, -1), 2, indices_expanded)
+        # Memory efficient retrieval avoiding massive tensor expansion
+        batch_idx = torch.arange(B, device=x_N.device).view(B, 1, 1)
+        x_gathered = x_N[batch_idx, indices]
         
         x_grid = (x_gathered * weights.unsqueeze(-1)).sum(dim=2)
         H = int(M**0.5)
