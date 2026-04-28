@@ -415,6 +415,10 @@ def train(hp):
         epoch_gnorm_enc = 0.0
         epoch_gnorm_cnf = 0.0
         recon_steps = 0
+        epoch_ratio_sum = 0.0
+        epoch_ratio_steps = 0
+        epoch_ratio_min = float("inf")
+        epoch_ratio_max = float("-inf")
         
         loss_t_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
         loss_t_unweight_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
@@ -521,12 +525,17 @@ def train(hp):
                 k_val = getattr(hp, "teacher_k", 8.0)
                 b_val = getattr(hp, "teacher_b", 1.0)
                 q_val = getattr(hp, "teacher_q", 2.0)
-                d_val = getattr(hp, "teacher_d", 100000.0)
+                d_val = getattr(hp, "teacher_d", 20000.0)
                 
                 phase2_step = (epoch - PHASE1_EPOCHS) * STEPS_PER_EPOCH + step
                 n_t = 1.0 + k_val * torch.sigmoid(-b_val * t)
                 ratio = 1.0 - (1.0 / (q_val ** (phase2_step / d_val))) * n_t
                 ratio = torch.clamp(ratio, min=0.0, max=1.0)
+                ratio_mean_batch = ratio.mean().item()
+                epoch_ratio_sum += ratio_mean_batch
+                epoch_ratio_steps += 1
+                epoch_ratio_min = min(epoch_ratio_min, ratio.min().item())
+                epoch_ratio_max = max(epoch_ratio_max, ratio.max().item())
                 t_teacher = t * ratio
 
                 t_teacher = torch.clamp(t_teacher, min=T_MIN, max=T_MAX) # Ensure t_teacher is within reasonable bounds
@@ -676,6 +685,12 @@ def train(hp):
         avg_gene_unweighted = epoch_gene_unweighted / (step + 1)
         avg_gnorm_enc = epoch_gnorm_enc / (step + 1)
         avg_gnorm_cnf = epoch_gnorm_cnf / (step + 1)
+        if epoch_ratio_steps > 0:
+            avg_ratio = epoch_ratio_sum / epoch_ratio_steps
+        else:
+            avg_ratio = float("nan")
+            epoch_ratio_min = float("nan")
+            epoch_ratio_max = float("nan")
         
         writer.add_scalar('Loss/train_epoch', avg_loss, epoch + 1)
         writer.add_scalar('Loss/recon_epoch', avg_recon_loss, epoch + 1)
@@ -684,18 +699,21 @@ def train(hp):
         writer.add_scalar('Loss_Unweighted/gene_epoch', avg_gene_unweighted, epoch + 1)
         writer.add_scalar('GradNorm/encoder', avg_gnorm_enc, epoch + 1)
         writer.add_scalar('GradNorm/cnf', avg_gnorm_cnf, epoch + 1)
+        writer.add_scalar('Teacher/ratio_epoch', avg_ratio, epoch + 1)
         
         # Update epoch progress bar with average loss and grad norms
         epoch_pbar.set_postfix({
             'loss': f"{avg_loss:.4f}",
             'r_uw': f"{avg_recon_unweighted:.4f}",
             'g_uw': f"{avg_gene_unweighted:.4f}",
+            'ratio': f"{avg_ratio:.4f}" if epoch_ratio_steps > 0 else 'N/A',
             'g_enc': f"{avg_gnorm_enc:.2f}",
             'g_cnf': f"{avg_gnorm_cnf:.2f}"
         })
         print(
             f"\nEpoch {epoch+1}/{EPOCHS} "
             f"Avg Loss: {avg_loss:.6f} | Recon(W/UW): {avg_recon_loss:.6f}/{avg_recon_unweighted:.6f} | Gene(W/UW): {avg_gene_loss:.6f}/{avg_gene_unweighted:.6f} "
+            f"| Ratio(mean/min/max): {avg_ratio:.6f}/{epoch_ratio_min:.6f}/{epoch_ratio_max:.6f} "
             f"| GradNorm Enc: {avg_gnorm_enc:.4f} | GradNorm CNF: {avg_gnorm_cnf:.4f}"
         )
         
