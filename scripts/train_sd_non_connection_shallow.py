@@ -16,6 +16,7 @@ from basicutility import ReadInput as ri
 from src.dataset import ShallowWaterChunkDataset
 from src.siren import SIRENRenderer
 # from src.models import HyperNetwork, CNFRenderer
+from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23, HyperNetwork_Perceiver_v24
 from src.normalize import Normalizer_ts, compute_dataset_statistics
 from src.utils import *
@@ -129,7 +130,7 @@ def train(hp):
     LR_enc = getattr(hp, "lr_enc", 1e-4)
     LR_cnf = getattr(hp, "lr_cnf", 1e-4)
     STRIDE = getattr(hp, "stride", T_CHUNK)
-    DATA_RATIO = float(getattr(hp, "data_ratio", 0.1))
+    DATA_RATIO = float(getattr(hp, "data_ratio", 1.0))
     MAX_SIMS = getattr(hp, "max_sims", None)
     SUBSET_SEED = int(getattr(hp, "subset_seed", 42))
     SIM_INDICES_CFG = getattr(hp, "sim_indices", None)
@@ -293,6 +294,15 @@ def train(hp):
             use_node_type=getattr(hp, "use_node_type", False),
             is_spherical=getattr(hp, "is_spherical", True)
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_GINO":
+        print("Using GINO-based HyperNetwork")
+        encoder = HyperNetwork_GINO(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC
+        ).to(device)
     else:
         ## Error
         raise ValueError(f"Unsupported ENCODER_TYPE: {ENCODER_TYPE}")
@@ -326,6 +336,16 @@ def train(hp):
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF,
             use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_GINO":
+        print("Using GINO-based GaborRenderer")
+        cnf = GaborRenderer_GINO(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF
         ).to(device)
     elif RENDERER_TYPE == "SIREN":
         print("Using SIRENRenderer")
@@ -474,8 +494,12 @@ def train(hp):
             optimizer_encoder.zero_grad()
             optimizer_cnf.zero_grad()
             
-            # 使用高斯随机场 (GRF) 替代纯白噪声，保持空间连续性，减轻全局池化下的模式崩塌
-            noise = generate_spatial_grf(coords, target_shape=x_real.shape, length_scale=0.15, grid_size=64)
+            if getattr(hp, "noise_type", "gaussian").lower() == "grf":
+                # 使用高斯随机场 (GRF) 替代纯白噪声，保持空间连续性，减轻全局池化下的模式崩塌
+                noise = generate_spatial_grf(coords, target_shape=x_real.shape, length_scale=0.15, grid_size=64)
+            else:
+                # 纯高斯白噪声 (默认)
+                noise = torch.randn_like(x_real)
             
             # --- Random Point Drop for Zero-Shot & Unconditional Support ---
             N_pts = coords.shape[1]

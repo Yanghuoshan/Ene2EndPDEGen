@@ -49,7 +49,9 @@ def inference_demo(hp):
             chunk_size=T_CHUNK,
             stride=STRIDE,
             mode='test', # or train
-            return_mesh_info=True
+            return_mesh_info=True,
+            enforce_same_trajectory_batch = True,
+            trajectory_batch_size = None,
         )
         
         # 允许在配置文件中指定使用哪个 simulation (sim_idx)，如果不指定则默认随机选取一个

@@ -14,6 +14,7 @@ from tqdm import tqdm
 from basicutility import ReadInput as ri
 from src.dataset import MHDChunkDataset
 from src.siren import SIRENRenderer
+from src.models_ae import HyperNetwork_GINO3D, GaborRenderer_GINO3D
 # from src.models import HyperNetwork, CNFRenderer
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts, compute_dataset_statistics
@@ -244,6 +245,16 @@ def train(hp):
             use_node_type=False,
             use_flash_attn=True
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_GINO3D":
+        print("Using GINO3D-based HyperNetwork for enhanced spatial modeling")
+        encoder = HyperNetwork_GINO3D(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC,
+            coord_dim=3
+        ).to(device)
     else:
         ## Error
         raise ValueError(f"Unsupported ENCODER_TYPE: {ENCODER_TYPE}")
@@ -279,6 +290,16 @@ def train(hp):
             num_layers=NUM_LAYERS_CNF,
             use_node_type=False,
             use_flash_attn=True
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_GINO3D":
+        print("Using GINO3D-based GaborRenderer for enhanced spatial modeling in rendering")
+        cnf = GaborRenderer_GINO3D(
+            latent_dim=LATENT_DIM, 
+            coord_dim=3, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF
         ).to(device)
     elif RENDERER_TYPE == "SIREN":
         print("Using SIRENRenderer as a simpler baseline")
