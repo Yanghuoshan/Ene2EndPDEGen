@@ -600,6 +600,10 @@ class MHDChunkDataset(IterableDataset):
             if fields_sim.shape[0] < self.chunk_size:
                 continue
 
+            # Generate all possible t_start indices and shuffle them
+            t_starts = list(range(0, velocity.shape[0] - self.chunk_size + 1, self.stride))
+            rng.shuffle(t_starts)
+
             for t_start in range(0, fields_sim.shape[0] - self.chunk_size + 1, self.stride):
                 chunk_fields = fields_sim[t_start : t_start + self.chunk_size]
                 yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)

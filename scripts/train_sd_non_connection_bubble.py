@@ -12,10 +12,9 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from basicutility import ReadInput as ri
-from src.dataset import MHDChunkDataset
-from src.siren import SIRENRenderer
-from src.models_ae import HyperNetwork_GINO3D, GaborRenderer_GINO3D
+from src.dataset2 import PoolBoilingChunkDataset
 # from src.models import HyperNetwork, CNFRenderer
+from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts, compute_dataset_statistics
 from src.utils import *
@@ -161,11 +160,6 @@ def train(hp):
     os.makedirs(SAVE_PATH, exist_ok=True)
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
     
-    # 开启 TF32 及 cuDNN benchmark 进一步加速并平衡显存
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
     # Tensorboard writer
     log_dir = os.path.join(SAVE_PATH, "tensorboard_logs")
     writer = SummaryWriter(log_dir=log_dir)
@@ -173,15 +167,16 @@ def train(hp):
     # 2. Build Dataset & DataLoader
     # (Wrapped in try/except so if dataset path is missing, users know what to edit)
     try:
+        from src.dataset2 import PoolBoilingChunkDataset
         import numpy as np
         
-        dataset = MHDChunkDataset(
+        dataset = PoolBoilingChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             stride=STRIDE,
-            mode='train',
-            downsample_factor=getattr(hp, "downsample_factor", 1) if getattr(hp, "use_downsample", False) else 1
+            mode='train'
         )
+        
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=getattr(hp, "num_workers", 4))
         STEPS_PER_EPOCH = _estimate_steps_per_epoch(
             dataset,
@@ -228,9 +223,7 @@ def train(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
-            coord_dim=3,
-            use_node_type=False,
-            use_flash_attn=True
+            use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
     elif ENCODER_TYPE == "HyperNetwork_Perceiver_v23":
         print("Using Perceiver_v23-based HyperNetwork with improved time conditioning")
@@ -241,21 +234,18 @@ def train(hp):
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
             num_tokens=NUM_TOKENS,
-            coord_dim=3,
-            use_node_type=False,
-            use_flash_attn=True
+            use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
-    elif ENCODER_TYPE == "HyperNetwork_GINO3D":
-        print("Using GINO3D-based HyperNetwork for enhanced spatial modeling")
-        encoder = HyperNetwork_GINO3D(
+    elif ENCODER_TYPE == "HyperNetwork_GINO":
+        print("Using GINO-based HyperNetwork")
+        encoder = HyperNetwork_GINO(
             t_chunk=T_CHUNK,
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
-            coord_dim=3,
             use_gino=getattr(hp, "use_gino", False),
-            gno_radius=getattr(hp, "gno_radius", 0.05)
+            gno_radius=getattr(hp, "gno_radius", 0.05),
         ).to(device)
     else:
         ## Error
@@ -273,47 +263,33 @@ def train(hp):
         print("Using GaborRenderer_v22")
         cnf = GaborRenderer_v22(
             latent_dim=LATENT_DIM, 
-            coord_dim=3, 
+            coord_dim=2, 
             t_chunk=T_CHUNK, 
             channel_out=C_OUT, 
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF,
-            use_node_type=False,
-            use_flash_attn=True
+            use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
     elif RENDERER_TYPE == "GaborRenderer_v23":
         print("Using GaborRenderer_v23 with improved conditioning and stability")
         cnf = GaborRenderer_v23(
             latent_dim=LATENT_DIM, 
-            coord_dim=3, 
+            coord_dim=2, 
             t_chunk=T_CHUNK, 
             channel_out=C_OUT, 
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF,
-            use_node_type=False,
-            use_flash_attn=True
+            use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
-    elif RENDERER_TYPE == "GaborRenderer_GINO3D":
-        print("Using GINO3D-based GaborRenderer for enhanced spatial modeling in rendering")
-        cnf = GaborRenderer_GINO3D(
+    elif RENDERER_TYPE == "GaborRenderer_GINO":
+        print("Using GINO-based GaborRenderer")
+        cnf = GaborRenderer_GINO(
             latent_dim=LATENT_DIM, 
-            coord_dim=3, 
+            coord_dim=2, 
             t_chunk=T_CHUNK, 
             channel_out=C_OUT, 
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF
-        ).to(device)
-    elif RENDERER_TYPE == "SIREN":
-        print("Using SIRENRenderer as a simpler baseline")
-        cnf = SIRENRenderer(
-            latent_dim=LATENT_DIM, 
-            coord_dim=3, 
-            t_chunk=T_CHUNK, 
-            channel_out=C_OUT, 
-            hidden_dim=HIDDEN_DIM, 
-            num_layers=NUM_LAYERS_CNF,
-            use_node_type=False,
-            use_flash_attn=True
         ).to(device)
     else:
         ## Error
@@ -427,13 +403,17 @@ def train(hp):
         epoch_gnorm_enc = 0.0
         epoch_gnorm_cnf = 0.0
         recon_steps = 0
+        epoch_ratio_sum = 0.0
+        epoch_ratio_steps = 0
+        epoch_ratio_min = float("inf")
+        epoch_ratio_max = float("-inf")
         
         loss_t_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
         loss_t_unweight_sums = { '1.0': 0.0, '0.75': 0.0, '0.5': 0.0, '0.25': 0.0, '0.0': 0.0 }
         loss_t_counts = { '1.0': 0, '0.75': 0, '0.5': 0, '0.25': 0, '0.0': 0 }
         
         for step, (coords_batch, traj_batch) in enumerate(dataloader):
-            # coords_batch: [B, N, 3]
+            # coords_batch: [B, N, 2]
             # traj_batch:   [B, T, N, C]
             coords = coords_batch.to(device)
             x_real = traj_batch.to(device)
@@ -444,15 +424,18 @@ def train(hp):
             x_real = field_normalizer.normalize(x_real)
 
             # ===== A. Common Setup =====
-            optimizer_encoder.zero_grad(set_to_none=True)
-            optimizer_cnf.zero_grad(set_to_none=True)
+            optimizer_encoder.zero_grad()
+            optimizer_cnf.zero_grad()
             
             # Sample Pure Noise matching physical shape
             noise = torch.randn_like(x_real)
             
+            # --- Random Point Drop for Zero-Shot & Unconditional Support ---
             N_pts = coords.shape[1]
-            indices = torch.arange(N_pts, device=device)
+            keep_ratio = torch.rand(1).item() * 0.6 + 0.4 # Keep 40% to 100% points
+            M_pts = max(1, int(N_pts * keep_ratio))
             
+            indices = torch.randperm(N_pts)[:M_pts].to(device)
             coords_obs = coords[:, indices, :]
             coords_query = coords
             
@@ -482,14 +465,11 @@ def train(hp):
                 c_in = 1.0 / torch.sqrt(sigma**2 + sigma_data**2) # Pre-conditioning
                 
                 # 1. Predict clean dynamic latent Z1 from noisy data and coords 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
+                z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
 
-                    # 2. Render trajectory directly using Z1 and spatial coordinates
-                    f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
+                # 2. Render trajectory directly using Z1 and spatial coordinates
+                f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
                 
-                f_theta = f_theta.float()
-
                 # ===== C. Data-Space Supervision =====
                 # small_noise_mask1 = (t < T_EPS1).float().view(B, 1, 1, 1)
 
@@ -533,12 +513,17 @@ def train(hp):
                 k_val = getattr(hp, "teacher_k", 8.0)
                 b_val = getattr(hp, "teacher_b", 1.0)
                 q_val = getattr(hp, "teacher_q", 2.0)
-                d_val = getattr(hp, "teacher_d", 10000.0)
+                d_val = getattr(hp, "teacher_d", 5000.0)
                 
                 phase2_step = (epoch - PHASE1_EPOCHS) * STEPS_PER_EPOCH + step
                 n_t = 1.0 + k_val * torch.sigmoid(-b_val * t)
                 ratio = 1.0 - (1.0 / (q_val ** (phase2_step / d_val))) * n_t
                 ratio = torch.clamp(ratio, min=0.0, max=1.0)
+                ratio_mean_batch = ratio.mean().item()
+                epoch_ratio_sum += ratio_mean_batch
+                epoch_ratio_steps += 1
+                epoch_ratio_min = min(epoch_ratio_min, ratio.min().item())
+                epoch_ratio_max = max(epoch_ratio_max, ratio.max().item())
                 t_teacher = t * ratio
 
                 t_teacher = torch.clamp(t_teacher, min=T_MIN, max=T_MAX) # Ensure t_teacher is within reasonable bounds
@@ -552,24 +537,20 @@ def train(hp):
                 c_in = 1.0 / torch.sqrt(sigma**2 + sigma_data**2) # Pre-conditioning
                 
                 # 1. Predict clean dynamic latent Z1 from noisy data and coords 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
+                z1_pred = encoder(c_in * x_noisy_obs, coords_obs, t) # [B, LATENT_DIM]
 
-                    # 2. Render trajectory directly using Z1 and spatial coordinates
-                    f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
+                # 2. Render trajectory directly using Z1 and spatial coordinates
+                f_theta = cnf(z1_pred, coords_query) # [B, T_CHUNK, N, C]
                 
                 # Direct prediction
-                x_pred = f_theta.float()
+                x_pred = f_theta
 
                 with torch.no_grad():
                     c_in_teach = 1.0 / torch.sqrt(t_teacher_expand**2 + sigma_data**2)
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        z_target = encoder_ema(c_in_teach * x_noisy_teacher_obs, coords_obs, t_teacher).detach()
-                        f_theta_teacher = cnf_ema(z_target, coords_query).detach()
+                    z_target = encoder_ema(c_in_teach * x_noisy_teacher_obs, coords_obs, t_teacher).detach()
+                    f_theta_teacher = cnf_ema(z_target, coords_query).detach()
                     
-                    x_pred_teacher = f_theta_teacher.float()
-
-                f_theta = f_theta.float()
+                    x_pred_teacher = f_theta_teacher
 
                 # ===== C. Data-Space Supervision =====
                 loss_weight = 1.0 / torch.sqrt(t ** 2 + sigma_data**2) # Higher weight for smaller t, similar to EDM's weighting strategy, shape: [B]
@@ -685,11 +666,6 @@ def train(hp):
 
             # Remove inner pbar postfix update
             
-            # 手动释放大显存张量从而降低峰值显存占用
-            del x_noisy, x_noisy_obs, coords_obs, coords_query, z1_pred, f_theta, loss
-            if epoch >= PHASE1_EPOCHS:
-                del x_noisy_teacher, x_noisy_teacher_obs, x_noisy_query, z_target, f_theta_teacher, x_pred, x_pred_teacher, delta, delta_norm
-            
         avg_loss = epoch_loss / (step + 1)
         avg_recon_loss = epoch_recon_loss / max(recon_steps, 1)
         avg_gene_loss = epoch_gene_loss / (step + 1)
@@ -697,6 +673,12 @@ def train(hp):
         avg_gene_unweighted = epoch_gene_unweighted / (step + 1)
         avg_gnorm_enc = epoch_gnorm_enc / (step + 1)
         avg_gnorm_cnf = epoch_gnorm_cnf / (step + 1)
+        if epoch_ratio_steps > 0:
+            avg_ratio = epoch_ratio_sum / epoch_ratio_steps
+        else:
+            avg_ratio = float("nan")
+            epoch_ratio_min = float("nan")
+            epoch_ratio_max = float("nan")
         
         writer.add_scalar('Loss/train_epoch', avg_loss, epoch + 1)
         writer.add_scalar('Loss/recon_epoch', avg_recon_loss, epoch + 1)
@@ -705,18 +687,21 @@ def train(hp):
         writer.add_scalar('Loss_Unweighted/gene_epoch', avg_gene_unweighted, epoch + 1)
         writer.add_scalar('GradNorm/encoder', avg_gnorm_enc, epoch + 1)
         writer.add_scalar('GradNorm/cnf', avg_gnorm_cnf, epoch + 1)
+        writer.add_scalar('Teacher/ratio_epoch', avg_ratio, epoch + 1)
         
         # Update epoch progress bar with average loss and grad norms
         epoch_pbar.set_postfix({
             'loss': f"{avg_loss:.4f}",
             'r_uw': f"{avg_recon_unweighted:.4f}",
             'g_uw': f"{avg_gene_unweighted:.4f}",
+            'ratio': f"{avg_ratio:.4f}" if epoch_ratio_steps > 0 else 'N/A',
             'g_enc': f"{avg_gnorm_enc:.2f}",
             'g_cnf': f"{avg_gnorm_cnf:.2f}"
         })
         print(
             f"\nEpoch {epoch+1}/{EPOCHS} "
             f"Avg Loss: {avg_loss:.6f} | Recon(W/UW): {avg_recon_loss:.6f}/{avg_recon_unweighted:.6f} | Gene(W/UW): {avg_gene_loss:.6f}/{avg_gene_unweighted:.6f} "
+            f"| Ratio(mean/min/max): {avg_ratio:.6f}/{epoch_ratio_min:.6f}/{epoch_ratio_max:.6f} "
             f"| GradNorm Enc: {avg_gnorm_enc:.4f} | GradNorm CNF: {avg_gnorm_cnf:.4f}"
         )
         

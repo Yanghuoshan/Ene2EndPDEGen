@@ -253,7 +253,9 @@ def train(hp):
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
             depth=DEPTH_ENC,
-            coord_dim=3
+            coord_dim=3,
+            use_gino=getattr(hp, "use_gino", False),
+            gno_radius=getattr(hp, "gno_radius", 0.05)
         ).to(device)
     else:
         ## Error
