@@ -5,6 +5,7 @@ import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
 from src.models import HyperNetwork, CNFRenderer
+from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.normalize import Normalizer_ts
 from time import time
@@ -88,6 +89,15 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_GINO":
+        print("Using GINO-based HyperNetwork")
+        encoder = HyperNetwork_GINO(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -120,6 +130,16 @@ def inference_demo(hp):
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF, 
             use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_GINO":
+        print("Using GINO-based GaborRenderer")
+        cnf = GaborRenderer_GINO(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF
         ).to(device)
     else:
         print("Using standard CNFRenderer")
