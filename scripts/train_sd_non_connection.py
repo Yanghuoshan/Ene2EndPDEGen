@@ -257,7 +257,9 @@ def train(hp):
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC
+            depth=DEPTH_ENC,
+            use_gino=getattr(hp, "use_gino", False),
+            gno_radius=getattr(hp, "gno_radius", 0.05),
         ).to(device)
     else:
         ## Error
@@ -525,7 +527,7 @@ def train(hp):
                 k_val = getattr(hp, "teacher_k", 8.0)
                 b_val = getattr(hp, "teacher_b", 1.0)
                 q_val = getattr(hp, "teacher_q", 2.0)
-                d_val = getattr(hp, "teacher_d", 20000.0)
+                d_val = getattr(hp, "teacher_d", 10000.0)
                 
                 phase2_step = (epoch - PHASE1_EPOCHS) * STEPS_PER_EPOCH + step
                 n_t = 1.0 + k_val * torch.sigmoid(-b_val * t)

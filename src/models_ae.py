@@ -65,14 +65,16 @@ class HyperNetwork_GINO(nn.Module):
         self.register_buffer("latent_grid", self.get_latent_grid(self.latent_grid_size))
         
         if self.use_gino:
+            self.register_buffer("latent_queries", self.latent_grid.view(1, self.latent_grid_size, self.latent_grid_size, -1))
             self.gino_encoder = GINO_Encoder(
                 in_channels=freq_in_channels,
                 projection_channels=hidden_dim,
                 gno_coord_dim=coord_dim,
                 gno_radius=gno_radius,
-                gno_mlp_hidden_layers=[80, 80, 80],
+                gno_mlp_hidden_layers=[64, 64, 64, 64],
                 gno_mlp_non_linearity=F.gelu,
                 gno_transform_type='linear',
+                use_open3d=False
             )
 
         # 2. DiT processing
@@ -139,7 +141,7 @@ class HyperNetwork_GINO(nn.Module):
             for i in range(B):
                 x_batch = x_noisy_freq[i].unsqueeze(0)
                 coords_batch = coords[i].unsqueeze(0)
-                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_grid)
+                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_queries)
                 grid_latents_list.append(latent_batch)
             grid_latents = torch.cat(grid_latents_list, dim=0) # [B, 64, 64, hidden_dim]
             grid_latents = grid_latents.permute(0, 3, 1, 2) # [B, hidden_dim, 64, 64]
@@ -328,6 +330,7 @@ class HyperNetwork_GINO3D(nn.Module):
         self.register_buffer("latent_grid", self.get_latent_grid(self.latent_grid_size))
         
         if self.use_gino:
+            self.register_buffer("latent_queries", self.latent_grid.view(1, self.latent_grid_size, self.latent_grid_size, self.latent_grid_size, -1))
             self.gino_encoder = GINO_Encoder(
                 in_channels=freq_in_channels,
                 projection_channels=hidden_dim,
@@ -403,7 +406,7 @@ class HyperNetwork_GINO3D(nn.Module):
             for i in range(B):
                 x_batch = x_noisy_freq[i].unsqueeze(0)
                 coords_batch = coords[i].unsqueeze(0)
-                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_grid)
+                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_queries)
                 grid_latents_list.append(latent_batch)
             grid_latents = torch.cat(grid_latents_list, dim=0) # [B, 16, 16, 16, hidden_dim]
             grid_latents = grid_latents.permute(0, 4, 1, 2, 3) # [B, hidden_dim, 16, 16, 16]
