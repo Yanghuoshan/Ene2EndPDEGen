@@ -339,6 +339,7 @@ class HyperNetwork_GINO3D(nn.Module):
                 gno_mlp_hidden_layers=[80, 80, 80],
                 gno_mlp_non_linearity=F.gelu,
                 gno_transform_type='linear',
+                use_open3d=False
             )
 
         # 2. DiT processing
