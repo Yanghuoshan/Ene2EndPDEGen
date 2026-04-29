@@ -7,6 +7,7 @@ from src.dataset import TrajectoryChunkDataset, H5DirectoryChunkDataset
 from src.models import HyperNetwork, CNFRenderer
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, GaborRenderer_v22_alter, HyperNetwork_Perceiver_v23, GaborRenderer_v23
 from src.models_v2 import HyperNetwork_Perceiver_v5, GaborRenderer_v5, HyperNetwork_Perceiver_v55, GaborRenderer_v55
+from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.normalize import Normalizer_ts
 from time import time
 
@@ -50,8 +51,8 @@ def inference_demo(hp):
             stride=STRIDE,
             mode='test', # or train
             return_mesh_info=True,
-            enforce_same_trajectory_batch = True,
-            trajectory_batch_size = None,
+            # enforce_same_trajectory_batch = True,
+            # trajectory_batch_size = None,
         )
         
         # 允许在配置文件中指定使用哪个 simulation (sim_idx)，如果不指定则默认随机选取一个
@@ -164,6 +165,15 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=USE_NODE_TYPE
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_GINO":
+        print("Using GINO-based HyperNetwork")
+        encoder = HyperNetwork_GINO(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -229,6 +239,16 @@ def inference_demo(hp):
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF, 
             use_node_type=USE_NODE_TYPE
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_GINO":
+        print("Using GINO-based GaborRenderer")
+        cnf = GaborRenderer_GINO(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF
         ).to(device)
     else:
         print("Using standard CNFRenderer")

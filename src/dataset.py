@@ -605,6 +605,182 @@ class MHDChunkDataset(IterableDataset):
                 yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)
 
 
+class OpenFOAMVelocityChunkDataset(IterableDataset):
+    """
+    Reads a single OpenFOAM-style HDF5 file and yields time chunks of velocity fields.
+
+    Expected layout:
+        - /data/u: [T, N, 3]
+        - /grid/cell_idx: [N] (optional, active-cell indices into the structured grid)
+        - /grid/cell_counts: [3]
+        - /geometry/bounding_box: [3]
+
+    Output:
+        coords: [N, 3]
+        chunk_fields: [T_chunk, N, 3]
+    """
+    def __init__(
+        self,
+        dataset_path: str,
+        chunk_size: int = 16,
+        stride: int = None,
+        mode: str = "train",
+        seed: int = 42,
+        downsample_factor: int = 1,
+    ):
+        super().__init__()
+        self.dataset_path = dataset_path
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+        self.chunk_size = chunk_size
+        self.stride = stride if stride is not None else chunk_size // 2
+        if self.stride <= 0:
+            raise ValueError(f"stride must be > 0, got {self.stride}")
+        self.mode = mode
+        self.seed = seed
+        self.is_train = mode == "train"
+        self.downsample_factor = downsample_factor
+
+        if os.path.isdir(self.dataset_path):
+            self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.h5"))
+            if not self.file_paths:
+                self.file_paths = glob.glob(os.path.join(self.dataset_path, "*.hdf5"))
+            self.file_paths.sort()
+        else:
+            self.file_paths = [self.dataset_path]
+
+        self.num_sims = len(self.file_paths)
+        if self.num_sims == 0:
+            raise ValueError(f"No h5 files found in {self.dataset_path}")
+
+        with h5py.File(self.file_paths[0], "r") as f:
+            velocity = np.array(f["data"]["u"], dtype=np.float32)
+            if velocity.ndim != 3 or velocity.shape[-1] != 3:
+                raise ValueError(f"/data/u must have shape [T, N, 3], got {velocity.shape}")
+
+            self.traj_len = int(velocity.shape[0])
+            self.shape_t = self.traj_len
+            self.num_channels = int(velocity.shape[-1])
+            self.num_points = int(velocity.shape[1])
+
+            cell_counts = None
+            if "grid" in f and "cell_counts" in f["grid"]:
+                cell_counts = np.array(f["grid"]["cell_counts"], dtype=np.int64).reshape(-1)
+                if cell_counts.size != 3:
+                    raise ValueError(f"/grid/cell_counts must have shape [3], got {cell_counts.shape}")
+
+            bbox = None
+            if "geometry" in f and "bounding_box" in f["geometry"]:
+                bbox = np.array(f["geometry"]["bounding_box"], dtype=np.float32).reshape(-1)
+                if bbox.size != 3:
+                    raise ValueError(f"/geometry/bounding_box must have shape [3], got {bbox.shape}")
+
+            cell_idx = None
+            if "grid" in f and "cell_idx" in f["grid"]:
+                cell_idx = np.array(f["grid"]["cell_idx"], dtype=np.int64).reshape(-1)
+
+            if cell_counts is not None and bbox is not None:
+                nx, ny, nz = (int(cell_counts[0]), int(cell_counts[1]), int(cell_counts[2]))
+                x = np.linspace(0.0, float(bbox[0]), nx)
+                y = np.linspace(0.0, float(bbox[1]), ny)
+                z = np.linspace(0.0, float(bbox[2]), nz)
+                x_grid, y_grid, z_grid = np.meshgrid(x, y, z, indexing="ij")
+                full_coords = np.stack([x_grid, y_grid, z_grid], axis=-1).reshape(-1, 3)
+
+                if cell_idx is not None:
+                    if cell_idx.ndim != 1:
+                        raise ValueError(f"/grid/cell_idx must be 1D, got {cell_idx.shape}")
+                    if cell_idx.shape[0] != self.num_points:
+                        raise ValueError(
+                            f"/grid/cell_idx length ({cell_idx.shape[0]}) does not match /data/u nodes ({self.num_points})"
+                        )
+                    if cell_idx.min() < 0 or cell_idx.max() >= full_coords.shape[0]:
+                        raise ValueError(
+                            f"/grid/cell_idx contains values outside the structured grid: "
+                            f"min={cell_idx.min()}, max={cell_idx.max()}, grid_size={full_coords.shape[0]}"
+                        )
+                    coords = full_coords[cell_idx]
+                else:
+                    coords = full_coords[: self.num_points]
+            else:
+                points = np.array(f["domain"]["points"], dtype=np.float32)
+                if points.shape[0] >= self.num_points:
+                    coords = points[: self.num_points]
+                else:
+                    raise ValueError(
+                        f"Unable to align coordinates with velocity field: points={points.shape}, velocity={velocity.shape}"
+                    )
+
+            if self.downsample_factor > 1:
+                coords = coords[:: self.downsample_factor]
+                self.num_points = coords.shape[0]
+
+            self.coords = torch.tensor(coords, dtype=torch.float32)
+
+        self.sim_indices = list(range(self.num_sims))
+        self.epoch = 0
+        self.use_vo = False
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _load_all_fields(self, sim_idx):
+        file_path = self.file_paths[sim_idx]
+        with h5py.File(file_path, "r") as f:
+            velocity = np.array(f["data"]["u"], dtype=np.float32)
+        if self.downsample_factor > 1:
+            velocity = velocity[:, :: self.downsample_factor, :]
+        return velocity
+
+    def _load_sim_data(self, sim_idx: int):
+        file_path = self.file_paths[sim_idx]
+        with h5py.File(file_path, "r") as f:
+            velocity = f["data"]["u"]
+            if self.downsample_factor > 1:
+                velocity = velocity[:, :: self.downsample_factor, :]
+            velocity = np.array(velocity, dtype=np.float32)
+
+        if velocity.ndim != 3 or velocity.shape[-1] != 3:
+            raise ValueError(f"/data/u must have shape [T, N, 3], got {velocity.shape}")
+
+        return velocity, None, None
+
+    def _get_worker_info(self):
+        info = get_worker_info()
+        return (0, 1) if info is None else (info.id, info.num_workers)
+
+    def __iter__(self):
+        worker_id, num_workers = self._get_worker_info()
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+
+        all_indices = np.array(self.sim_indices)
+        if global_num_workers <= 1:
+            worker_indices = all_indices.tolist()
+        else:
+            worker_indices = np.array_split(all_indices, global_num_workers)[global_worker_id].tolist()
+
+        rng = np.random.default_rng(self.seed + global_worker_id + self.epoch)
+        if self.is_train:
+            rng.shuffle(worker_indices)
+
+        for sim_idx in worker_indices:
+            velocity, _, _ = self._load_sim_data(sim_idx)
+            if velocity.shape[0] < self.chunk_size:
+                continue
+
+            # Generate all possible t_start indices and shuffle them
+            t_starts = list(range(0, velocity.shape[0] - self.chunk_size + 1, self.stride))
+            rng.shuffle(t_starts)
+            
+            for t_start in t_starts:
+                chunk_fields = velocity[t_start : t_start + self.chunk_size]
+                yield self.coords, torch.tensor(chunk_fields, dtype=torch.float32)
+
+
 class IgnitHitDataset(IterableDataset):
     """
     Reads IgnitHit npz files from a directory.

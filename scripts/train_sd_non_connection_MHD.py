@@ -531,7 +531,7 @@ def train(hp):
                 k_val = getattr(hp, "teacher_k", 8.0)
                 b_val = getattr(hp, "teacher_b", 1.0)
                 q_val = getattr(hp, "teacher_q", 2.0)
-                d_val = getattr(hp, "teacher_d", 100000.0)
+                d_val = getattr(hp, "teacher_d", 10000.0)
                 
                 phase2_step = (epoch - PHASE1_EPOCHS) * STEPS_PER_EPOCH + step
                 n_t = 1.0 + k_val * torch.sigmoid(-b_val * t)

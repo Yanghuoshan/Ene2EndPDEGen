@@ -108,6 +108,15 @@ def inference_demo(hp):
             num_tokens=NUM_TOKENS,
             use_node_type=getattr(hp, "use_node_type", False)
         ).to(device)
+    elif ENCODER_TYPE == "HyperNetwork_GINO":
+        print("Using GINO-based HyperNetwork")
+        encoder = HyperNetwork_GINO(
+            t_chunk=T_CHUNK,
+            channel_in=C_OUT,
+            latent_dim=LATENT_DIM,
+            hidden_dim=HIDDEN_DIM,
+            depth=DEPTH_ENC
+        ).to(device)
     else:
         print("Using standard HyperNetwork")
         encoder = HyperNetwork(
@@ -140,6 +149,16 @@ def inference_demo(hp):
             hidden_dim=HIDDEN_DIM, 
             num_layers=NUM_LAYERS_CNF, 
             use_node_type=getattr(hp, "use_node_type", False)
+        ).to(device)
+    elif RENDERER_TYPE == "GaborRenderer_GINO":
+        print("Using GINO-based GaborRenderer")
+        cnf = GaborRenderer_GINO(
+            latent_dim=LATENT_DIM, 
+            coord_dim=2, 
+            t_chunk=T_CHUNK, 
+            channel_out=C_OUT, 
+            hidden_dim=HIDDEN_DIM, 
+            num_layers=NUM_LAYERS_CNF
         ).to(device)
     elif RENDERER_TYPE == "SIREN":
         print("Using SIREN Renderer")
@@ -234,7 +253,7 @@ def inference_demo(hp):
         
         coords = original_coords # [B, N, 2]
         coords_norm = coord_normalizer.normalize(coords)
-        x = generate_spatial_grf(coords_norm, target_shape=(B, T, N, C), length_scale=0.15, grid_size=64).to(device) * t_max
+        x = torch.randn((B, T, N, C), device=device) * t_max
         
         # --- Unconditional Generation ---
         gt_init = None
@@ -262,7 +281,7 @@ def inference_demo(hp):
             
             if i < num_steps - 1:
                 # Add noise back to t_next
-                noise = generate_spatial_grf(coords_norm, target_shape=x.shape, length_scale=0.15, grid_size=64).to(device)
+                noise = torch.randn_like(x)
                 # Following Consistency Models: x_{n-1} = x0_pred + sqrt(t_{prev}^2 - t_min^2) * z
                 std = torch.sqrt(torch.clamp(t_next**2 - t_min**2, min=0.0))
                 x = x0_pred + std * noise

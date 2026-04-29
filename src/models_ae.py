@@ -4,7 +4,8 @@ import math
 
 import sys
 import os
-from src.gino_ae import ConditionalEncoder
+from src.gino_ae import ConditionalEncoder, GINO_Encoder
+import torch.nn.functional as F
 from src.transformer import DiT
 
 
@@ -45,10 +46,13 @@ class HyperNetwork_GINO(nn.Module):
                  hidden_dim=256, 
                  num_heads=8, 
                  depth=4,
-                 patch_size=2):
+                 patch_size=2,
+                 use_gino=False,
+                 gno_radius=0.05):
         super().__init__()
         self.t_chunk = t_chunk
         self.patch_size = patch_size
+        self.use_gino = use_gino
         
         freq_in_channels = (t_chunk // 2 + 1) * 2 * channel_in
         
@@ -60,6 +64,17 @@ class HyperNetwork_GINO(nn.Module):
         
         self.register_buffer("latent_grid", self.get_latent_grid(self.latent_grid_size))
         
+        if self.use_gino:
+            self.gino_encoder = GINO_Encoder(
+                in_channels=freq_in_channels,
+                projection_channels=hidden_dim,
+                gno_coord_dim=coord_dim,
+                gno_radius=gno_radius,
+                gno_mlp_hidden_layers=[80, 80, 80],
+                gno_mlp_non_linearity=F.gelu,
+                gno_transform_type='linear',
+            )
+
         # 2. DiT processing
         self.dit = DiT(
             input_size=[self.latent_grid_size, self.latent_grid_size],
@@ -119,11 +134,21 @@ class HyperNetwork_GINO(nn.Module):
         x_freq_real = torch.view_as_real(x_freq)
         x_noisy_freq = x_freq_real.permute(0, 2, 1, 3, 4).reshape(B, N, -1)
         
-        # 1. Map to hidden_dim
-        x_hidden = self.input_proj(x_noisy_freq) # [B, N, hidden_dim]
-        
-        # 2. Interpolate to 64x64 grid
-        grid_latents = self.interpolate_to_grid(x_hidden, coords, self.latent_grid) # [B, hidden_dim, 64, 64]
+        if self.use_gino:
+            grid_latents_list = []
+            for i in range(B):
+                x_batch = x_noisy_freq[i].unsqueeze(0)
+                coords_batch = coords[i].unsqueeze(0)
+                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_grid)
+                grid_latents_list.append(latent_batch)
+            grid_latents = torch.cat(grid_latents_list, dim=0) # [B, 64, 64, hidden_dim]
+            grid_latents = grid_latents.permute(0, 3, 1, 2) # [B, hidden_dim, 64, 64]
+        else:
+            # 1. Map to hidden_dim
+            x_hidden = self.input_proj(x_noisy_freq) # [B, N, hidden_dim]
+            
+            # 2. Interpolate to 64x64 grid
+            grid_latents = self.interpolate_to_grid(x_hidden, coords, self.latent_grid) # [B, hidden_dim, 64, 64]
         
         # 3. DiT processing
         dummy_context = self.null_context.expand(B, 1, -1)
@@ -284,10 +309,13 @@ class HyperNetwork_GINO3D(nn.Module):
                  hidden_dim=256, 
                  num_heads=8, 
                  depth=4,
-                 patch_size=2):
+                 patch_size=2,
+                 use_gino=False,
+                 gno_radius=0.05):
         super().__init__()
         self.t_chunk = t_chunk
         self.patch_size = patch_size
+        self.use_gino = use_gino
         
         freq_in_channels = (t_chunk // 2 + 1) * 2 * channel_in
         
@@ -299,6 +327,17 @@ class HyperNetwork_GINO3D(nn.Module):
         
         self.register_buffer("latent_grid", self.get_latent_grid(self.latent_grid_size))
         
+        if self.use_gino:
+            self.gino_encoder = GINO_Encoder(
+                in_channels=freq_in_channels,
+                projection_channels=hidden_dim,
+                gno_coord_dim=coord_dim,
+                gno_radius=gno_radius,
+                gno_mlp_hidden_layers=[80, 80, 80],
+                gno_mlp_non_linearity=F.gelu,
+                gno_transform_type='linear',
+            )
+
         # 2. DiT processing
         self.dit = DiT(
             input_size=[self.latent_grid_size, self.latent_grid_size, self.latent_grid_size],
@@ -359,11 +398,21 @@ class HyperNetwork_GINO3D(nn.Module):
         x_freq_real = torch.view_as_real(x_freq)
         x_noisy_freq = x_freq_real.permute(0, 2, 1, 3, 4).reshape(B, N, -1)
         
-        # 1. Map to hidden_dim
-        x_hidden = self.input_proj(x_noisy_freq) # [B, N, hidden_dim]
-        
-        # 2. Interpolate to 16x16x16 grid
-        grid_latents = self.interpolate_to_grid(x_hidden, coords, self.latent_grid) # [B, hidden_dim, 16, 16, 16]
+        if self.use_gino:
+            grid_latents_list = []
+            for i in range(B):
+                x_batch = x_noisy_freq[i].unsqueeze(0)
+                coords_batch = coords[i].unsqueeze(0)
+                latent_batch = self.gino_encoder(x_batch, coords_batch, self.latent_grid)
+                grid_latents_list.append(latent_batch)
+            grid_latents = torch.cat(grid_latents_list, dim=0) # [B, 16, 16, 16, hidden_dim]
+            grid_latents = grid_latents.permute(0, 4, 1, 2, 3) # [B, hidden_dim, 16, 16, 16]
+        else:
+            # 1. Map to hidden_dim
+            x_hidden = self.input_proj(x_noisy_freq) # [B, N, hidden_dim]
+            
+            # 2. Interpolate to 16x16x16 grid
+            grid_latents = self.interpolate_to_grid(x_hidden, coords, self.latent_grid) # [B, hidden_dim, 16, 16, 16]
         
         # 3. DiT processing
         dummy_context = self.null_context.expand(B, 1, -1)
