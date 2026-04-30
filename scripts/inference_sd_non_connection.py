@@ -96,7 +96,9 @@ def inference_demo(hp):
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC
+            depth=DEPTH_ENC,
+            use_gino=getattr(hp, "use_gino", False),
+            gno_radius=getattr(hp, "gno_radius", 0.05),
         ).to(device)
     else:
         print("Using standard HyperNetwork")

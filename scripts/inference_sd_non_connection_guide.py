@@ -114,7 +114,9 @@ def inference_demo(hp):
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC
+            depth=DEPTH_ENC,
+            use_gino=getattr(hp, "use_gino", False),
+            gno_radius=getattr(hp, "gno_radius", 0.05),
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -228,12 +230,12 @@ def inference_demo(hp):
             num_steps = 1
             print("Mode: 1-step fast generation")
         else:
-            num_steps = getattr(hp, "num_sampling_steps", 5)
+            num_steps = getattr(hp, "num_sampling_steps", 8)
             print(f"Mode: Multi-step consistency sampling ({num_steps} steps)")
 
         t_max = getattr(hp, "t_max", 80.0)
         t_min = getattr(hp, "t_min", 0.002)
-        rho = 7.0
+        rho = 5.0
         
         # EDM target timestep schedule (Karras et al. 2022)
         step_indices = torch.arange(num_steps, dtype=torch.float32, device=device)

@@ -39,11 +39,18 @@ def _parse_gpu_ids(gpu_ids_cfg, num_available):
     return ids
 
 
-def _load_model_state_dict(model, state_dict):
+def _load_model_state_dict(model, state_dict, strict=True):
     if isinstance(model, nn.DataParallel):
-        model.module.load_state_dict(state_dict)
+        return model.module.load_state_dict(state_dict, strict=strict)
     else:
-        model.load_state_dict(state_dict)
+        return model.load_state_dict(state_dict, strict=strict)
+
+
+def _pick_state_dict(ckpt, keys):
+    for k in keys:
+        if k in ckpt and isinstance(ckpt[k], dict):
+            return ckpt[k], k
+    return None, None
 
 
 def _find_latest_checkpoint(save_path):
@@ -139,6 +146,9 @@ def train(hp):
 
     AUTO_RESUME = getattr(hp, "auto_resume", True)
     RESUME_CHECKPOINT = getattr(hp, "resume_checkpoint", "latest")
+    INIT_MODEL_WEIGHTS = getattr(hp, "init_model_weights", "")
+    INIT_STRICT = getattr(hp, "init_strict", True)
+    INIT_LOAD_EMA = getattr(hp, "init_load_ema", False)
     LOSS_TYPE = getattr(hp, "loss_type", "MSE").upper()
     
     PHASE1_EPOCHS = getattr(hp, "phase1_epochs", EPOCHS // 2)
@@ -358,6 +368,47 @@ def train(hp):
         schedulers=[warmup_cnf, cosine_cnf, constant_cnf], 
         milestones=[WARMUP_EPOCHS, WARMUP_EPOCHS + COSINE_EPOCHS]
     )
+
+    # Optional: initialize model weights from another checkpoint but start a fresh training run.
+    if isinstance(INIT_MODEL_WEIGHTS, str) and INIT_MODEL_WEIGHTS.strip():
+        init_ckpt_path = INIT_MODEL_WEIGHTS.strip()
+        if not os.path.exists(init_ckpt_path):
+            raise FileNotFoundError(f"init_model_weights not found: {init_ckpt_path}")
+
+        print(f"Initializing model weights from: {init_ckpt_path}")
+        init_ckpt = torch.load(init_ckpt_path, map_location=device)
+
+        enc_state, enc_key = _pick_state_dict(init_ckpt, ["encoder_state_dict", "encoder", "model_state_dict", "state_dict"])
+        cnf_state, cnf_key = _pick_state_dict(init_ckpt, ["cnf_state_dict", "renderer_state_dict", "renderer"])
+
+        if enc_state is None or cnf_state is None:
+            raise KeyError(
+                "init_model_weights checkpoint must contain both encoder and cnf weights. "
+                "Expected keys like encoder_state_dict/cnf_state_dict."
+            )
+
+        _load_model_state_dict(encoder, enc_state, strict=INIT_STRICT)
+        _load_model_state_dict(cnf, cnf_state, strict=INIT_STRICT)
+        print(f"Loaded encoder from key '{enc_key}', cnf from key '{cnf_key}', strict={INIT_STRICT}")
+
+        if INIT_LOAD_EMA:
+            enc_ema_state, _ = _pick_state_dict(init_ckpt, ["encoder_ema_state_dict"])
+            cnf_ema_state, _ = _pick_state_dict(init_ckpt, ["cnf_ema_state_dict"])
+            if enc_ema_state is not None and cnf_ema_state is not None:
+                _load_model_state_dict(encoder_ema, enc_ema_state, strict=INIT_STRICT)
+                _load_model_state_dict(cnf_ema, cnf_ema_state, strict=INIT_STRICT)
+                print("Loaded EMA weights from init_model_weights checkpoint.")
+            else:
+                _load_model_state_dict(encoder_ema, _unwrap_state_dict(encoder), strict=True)
+                _load_model_state_dict(cnf_ema, _unwrap_state_dict(cnf), strict=True)
+                print("EMA weights not found in init checkpoint, EMA initialized from online model weights.")
+        else:
+            _load_model_state_dict(encoder_ema, _unwrap_state_dict(encoder), strict=True)
+            _load_model_state_dict(cnf_ema, _unwrap_state_dict(cnf), strict=True)
+
+        if AUTO_RESUME:
+            print("init_model_weights is set, auto_resume is ignored to start a fresh training run.")
+            AUTO_RESUME = False
 
     # 3.6 Optionally resume from the latest/specified checkpoint
     global_step = 0
