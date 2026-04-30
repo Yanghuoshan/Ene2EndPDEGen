@@ -451,10 +451,18 @@ def train(hp):
             noise = torch.randn_like(x_real)
             
             N_pts = coords.shape[1]
-            indices = torch.arange(N_pts, device=device)
+            
+            # randomly keep 1/8 of the points for observation
+            num_obs = N_pts // 8
+            indices = torch.randperm(N_pts, device=device)[:num_obs]
             
             coords_obs = coords[:, indices, :]
-            coords_query = coords
+            
+            # randomly keep 1/8 of the points for query
+            num_query = N_pts // 8
+            query_indices = torch.randperm(N_pts, device=device)[:num_query]
+            coords_query = coords[:, query_indices, :]
+            x_real_target = x_real[:, :, query_indices, :]
             
             def compute_element_loss(pred, target):
                 if LOSS_TYPE in ["L1", "MAE"]:
@@ -496,7 +504,7 @@ def train(hp):
                 loss_weight = 1.0 / torch.sqrt(t ** 2 + sigma_data**2) # Higher weight for smaller t, similar to EDM's weighting strategy
 
                 # L_recon: At small noise, force f_theta to learn gt
-                l_recon_unweighted = compute_element_loss(f_theta, x_real)
+                l_recon_unweighted = compute_element_loss(f_theta, x_real_target)
                 recon_loss = (l_recon_unweighted.reshape(B, -1).mean(dim=1) * loss_weight).mean()
 
                 # Stage 1: Only optimize L_recon
@@ -533,7 +541,7 @@ def train(hp):
                 k_val = getattr(hp, "teacher_k", 8.0)
                 b_val = getattr(hp, "teacher_b", 1.0)
                 q_val = getattr(hp, "teacher_q", 2.0)
-                d_val = getattr(hp, "teacher_d", 10000.0)
+                d_val = getattr(hp, "teacher_d", 5000.0)
                 
                 phase2_step = (epoch - PHASE1_EPOCHS) * STEPS_PER_EPOCH + step
                 n_t = 1.0 + k_val * torch.sigmoid(-b_val * t)
@@ -581,7 +589,7 @@ def train(hp):
                 small_noise_mask1 = (t < T_EPS2).float().view(B, 1, 1, 1)
 
                 # L_recon: At small noise, force f_theta to learn gt
-                l_recon_unweighted = compute_element_loss(f_theta, x_real) * small_noise_mask1
+                l_recon_unweighted = compute_element_loss(f_theta, x_real_target) * small_noise_mask1
                 recon_loss = (l_recon_unweighted.reshape(B, -1).mean(dim=1) * loss_weight).sum() / (small_noise_mask1.sum() + 1e-8)
 
                 # L_gene: Generation consistency loss between online and teacher
