@@ -4,6 +4,7 @@ import glob
 import torch
 from basicutility import ReadInput as ri
 from src.dataset import TrajectoryChunkDataset
+from src.dataset2 import NpyChunkDataset
 from src.models import HyperNetwork, CNFRenderer
 from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
@@ -40,11 +41,10 @@ def inference_demo(hp):
     NORM_PARAMS_PATH = os.path.join(SAVE_PATH, "normalizer_params.pt")
 
     try:
-        dataset = TrajectoryChunkDataset(
+        dataset = NpyChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
-            use_vo=False,
-            flatten=True,
+            stride=T_CHUNK, # non-overlapping chunks
             mode='test' # or train
         )
         # coords shape is [N, 2]
@@ -96,7 +96,9 @@ def inference_demo(hp):
             channel_in=C_OUT,
             latent_dim=LATENT_DIM,
             hidden_dim=HIDDEN_DIM,
-            depth=DEPTH_ENC
+            depth=DEPTH_ENC,
+            use_gino=getattr(hp, "use_gino", False),
+            gno_radius=getattr(hp, "gno_radius", 0.1)
         ).to(device)
     else:
         print("Using standard HyperNetwork")
@@ -268,18 +270,22 @@ def inference_demo(hp):
         import matplotlib.tri as mtri
         import numpy as np
 
+        vis_channel = getattr(hp, "vis_channel", 0)
+
         field = trajectory_pred.detach().cpu().numpy()
         coord = coords[0].detach().cpu().numpy()
+        print(f"Visualizing generated trajectory with shape {field.shape} ...")
+        print(f"Coordinate range: x [{coord[:,0].min():.2f}, {coord[:,0].max():.2f}], y [{coord[:,1].min():.2f}, {coord[:,1].max():.2f}]")
         
         frames = field.shape[1]  # T_CHUNK
         data0 = field[0, 0]      # first batch, first timestep [N, C]
         
         if data0.ndim == 2 and data0.shape[1] > 1:
-            values0 = np.linalg.norm(data0, axis=1)
+            values0 = data0[:, vis_channel] if vis_channel < data0.shape[1] else np.linalg.norm(data0, axis=1)
         else:
             values0 = data0.squeeze()
 
-        x = coord[:, 0]
+        x = coord[:, 0] * 8
         y = coord[:, 1]
         tri = mtri.Triangulation(x, y)
 
@@ -294,7 +300,7 @@ def inference_demo(hp):
         def update(t):
             data = field[0, t]
             if data.ndim == 2 and data.shape[1] > 1:
-                values = np.linalg.norm(data, axis=1)
+                values = data[:, vis_channel] if vis_channel < data.shape[1] else np.linalg.norm(data, axis=1)
             else:
                 values = data.squeeze()
             tpc.set_array(values)
