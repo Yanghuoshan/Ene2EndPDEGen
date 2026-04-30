@@ -470,6 +470,7 @@ class NpyChunkDataset(IterableDataset):
         self.data = self.data.reshape(self.shape_t, -1, self.channels)
         
         self.sim_indices = [0]
+        self.num_sims = len(self.sim_indices)
         self.epoch = 0
 
     def _load_all_fields(self, sim_idx: int):
@@ -544,6 +545,7 @@ class NpyDirChunkDataset(IterableDataset):
         self.coords = torch.tensor(coords, dtype=torch.float32)
 
         self.sim_indices = [0]
+        self.num_sims = len(self.sim_indices)
         self.epoch = 0
 
     def _load_all_fields(self, sim_idx: int):

@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from basicutility import ReadInput as ri
-from src.dataset2 import PoolBoilingChunkDataset
+from src.dataset2 import NpyChunkDataset
 # from src.models import HyperNetwork, CNFRenderer
 from src.models_ae import HyperNetwork_GINO, GaborRenderer_GINO
 from src.models_v22 import HyperNetwork_Perceiver_v22, GaborRenderer_v22, HyperNetwork_Perceiver_v23, GaborRenderer_v23
@@ -167,10 +167,10 @@ def train(hp):
     # 2. Build Dataset & DataLoader
     # (Wrapped in try/except so if dataset path is missing, users know what to edit)
     try:
-        # from src.dataset2 import PoolBoilingChunkDataset
+        # from src.dataset2 import NpyChunkDataset
         import numpy as np
         
-        dataset = PoolBoilingChunkDataset(
+        dataset = NpyChunkDataset(
             dataset_path=DATASET_PATH,
             chunk_size=T_CHUNK,
             stride=STRIDE,
