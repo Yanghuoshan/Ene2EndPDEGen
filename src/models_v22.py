@@ -281,6 +281,9 @@ class FullGaborLayer(nn.Module):
             + (self.mu ** 2).sum(-1)[None, :]
             - 2 * x @ self.mu.T
         )
+
+        D = D / x.shape[-1] # tmp add
+
         return torch.sin(self.linear(x)) * torch.exp(-0.5 * D * self.gamma[None, :])
 
 
@@ -409,7 +412,7 @@ class GaborRenderer_v22(nn.Module):
             FullGaborLayer(
                 in_features=coord_dim, 
                 out_features=hidden_dim, 
-                weight_scale=256.0 / math.sqrt(num_layers + 1), 
+                weight_scale=64.0 / math.sqrt(num_layers + 1), # tmp 256 -> 128
                 alpha=6.0 / (num_layers + 1), 
                 beta=1.0
             ) 

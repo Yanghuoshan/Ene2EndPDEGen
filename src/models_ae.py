@@ -33,6 +33,34 @@ class FullGaborLayer(nn.Module):
         return torch.sin(self.linear(x)) * torch.exp(-0.5 * D * self.gamma[None, :])
     
 
+class FullGaborLayer3D(nn.Module):
+    """
+    Standard Gabor-like filter as used in MFN (Multiplicative Filter Networks).
+    Incorporates both frequency sine transformations and spatial Gaussian envelopes.
+    """
+    def __init__(self, in_features, out_features, weight_scale=256.0, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.mu = nn.Parameter(2 * torch.rand(out_features, in_features) - 1)
+        self.gamma = nn.Parameter(
+            torch.distributions.gamma.Gamma(alpha, beta).sample((out_features,))
+        )
+        self.linear.weight.data *= weight_scale * torch.sqrt(self.gamma[:, None])
+        self.linear.bias.data.uniform_(-math.pi, math.pi)
+
+    def forward(self, x): 
+        D = (
+            (x ** 2).sum(-1)[..., None]
+            + (self.mu ** 2).sum(-1)[None, :]
+            - 2 * x @ self.mu.T
+        )
+        # 【修改点】按输入维度对距离进行缩放，防止高斯包络在 3D 下收缩过快
+        D = D / x.shape[-1]
+
+        return torch.sin(self.linear(x)) * torch.exp(-0.5 * D * self.gamma[None, :])
+    
+
+
 class HyperNetwork_GINO(nn.Module):
     """
     A HyperNetwork mapping mesh data to grid using simple IDW interpolation,
@@ -48,7 +76,8 @@ class HyperNetwork_GINO(nn.Module):
                  depth=4,
                  patch_size=2,
                  use_gino=False,
-                 gno_radius=0.05):
+                 gno_radius=0.05,
+                 latent_grid_size=64):
         super().__init__()
         self.t_chunk = t_chunk
         self.patch_size = patch_size
@@ -56,7 +85,7 @@ class HyperNetwork_GINO(nn.Module):
         
         freq_in_channels = (t_chunk // 2 + 1) * 2 * channel_in
         
-        self.latent_grid_size = 64
+        self.latent_grid_size = latent_grid_size
         self.resolution = 16  # After downsampling
 
         # 1. Map input to hidden dim
@@ -90,15 +119,20 @@ class HyperNetwork_GINO(nn.Module):
         )
 
         # 3. CNN compression (2 downsamples to go from 64x64 to 16x16)
-        self.downsample = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, hidden_dim),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, latent_dim, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, latent_dim),
-            nn.GELU(),
-            nn.Conv2d(latent_dim, latent_dim, kernel_size=3, stride=1, padding=1)
-        )
+        
+        num_downsamples = int(math.log2(self.latent_grid_size // self.resolution))
+
+        down_layers = []
+        for _ in range(num_downsamples):
+            down_layers.extend([
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(8, hidden_dim),
+                nn.GELU()
+            ])
+        
+        down_layers.append(nn.Conv2d(hidden_dim, latent_dim, kernel_size=3, stride=1, padding=1))
+
+        self.downsample = nn.Sequential(*down_layers)
 
         self.null_context = nn.Parameter(torch.zeros(1, 1, self.dit.t_embedder.mlp[2].out_features))
 
@@ -469,10 +503,11 @@ class GaborRenderer_GINO3D(nn.Module):
         
         # MFN basis filters processing pure spatial geometry
         self.filters = nn.ModuleList([
-            FullGaborLayer(
+            FullGaborLayer3D(
+            # FullGaborLayer(
                 in_features=coord_dim, 
                 out_features=hidden_dim, 
-                weight_scale=256.0 / math.sqrt(num_layers + 1), 
+                weight_scale=64.0 / math.sqrt(num_layers + 1), 
                 alpha=6.0 / (num_layers + 1), 
                 beta=1.0
             ) 
