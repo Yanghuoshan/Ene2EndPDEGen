@@ -273,12 +273,30 @@ class IntegralTransform(nn.Module):
                 in_features = f_y[neighbors["neighbors_index"]] # Get input features, which are function values for each riemann point
                 # Shape is [n_reipts, f_dim]
 
-        num_reps = (
-            neighbors["neighbors_row_splits"][1:]
-            - neighbors["neighbors_row_splits"][:-1]
-        ) # Gets number of riemann points to integrate over for each latent point
-
-        self_features = torch.repeat_interleave(x, num_reps, dim=0) # Repeat each latent point to the number of Riemann points
+        splits = neighbors["neighbors_row_splits"]
+        num_reps = (splits[1:] - splits[:-1])
+        
+        # Ensure repeats is on same device/dtype
+        num_reps = num_reps.to(torch.long).to(x.device)
+        
+        # If neighbors were provided for a batched set (i.e. splits were
+        # repeated across batch elements), num_reps may have length equal
+        # to batch_size * num_queries. In that case repeat x accordingly
+        # so torch.repeat_interleave receives a repeats vector matching
+        # the first dimension of x.
+        if num_reps.numel() == x.size(0):
+            x_for_repeat = x
+        else:
+            if num_reps.numel() % x.size(0) == 0:
+                batch_factor = int(num_reps.numel() // x.size(0))
+                x_for_repeat = x.repeat((batch_factor, 1))
+            else:
+                raise RuntimeError(
+                    f"Mismatch between number of repeats ({num_reps.numel()}) and "
+                    f"input x rows ({x.size(0)}); cannot align for repeat_interleave"
+                )
+        
+        self_features = torch.repeat_interleave(x_for_repeat, num_reps, dim=0)
         # shape is [n_reipts, latent_pos_dim] , latent_pos_dim should equal pos_dim
 
         agg_features = torch.cat([rep_features, self_features], dim=-1) # Concat latent and Riemann points, shape is [n_riepts, pos_dim + latent_pos_dim]
