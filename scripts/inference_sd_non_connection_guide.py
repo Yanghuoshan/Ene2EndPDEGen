@@ -230,12 +230,12 @@ def inference_demo(hp):
             num_steps = 1
             print("Mode: 1-step fast generation")
         else:
-            num_steps = getattr(hp, "num_sampling_steps", 8)
+            num_steps = getattr(hp, "num_sampling_steps", 10)
             print(f"Mode: Multi-step consistency sampling ({num_steps} steps)")
 
         t_max = getattr(hp, "t_max", 80.0)
         t_min = getattr(hp, "t_min", 0.002)
-        rho = 5.0
+        rho = 5.0 # 3.0 to 7.0
         
         # EDM target timestep schedule (Karras et al. 2022)
         step_indices = torch.arange(num_steps, dtype=torch.float32, device=device)
@@ -297,8 +297,8 @@ def inference_demo(hp):
             
             
             if i < num_steps - 1:
-                # 强化引导：将网络预测的去噪干净数据强制对齐真实初始帧，再添加下一步的联合去噪过程噪声
-                x0_pred[:, 0:1, :, :] = gt_init
+                # 不再强制替换第一帧，只保留 DPS 梯度引导
+                # x0_pred[:, 0:1, :, :] = gt_init
                 # Add noise back to t_next
                 noise = torch.randn_like(x_guided)
                 # Following Consistency Models: x_{n-1} = x0_pred + sqrt(t_{prev}^2 - t_min^2) * z
@@ -327,6 +327,17 @@ def inference_demo(hp):
         field_pred = trajectory_pred.detach().cpu().numpy()  # [1, T_CHUNK, N, C]
         field_gt = gt_fields_tensor.cpu().numpy()            # [1, T_CHUNK, N, C]
         coord = coords[0].detach().cpu().numpy()
+
+        field_pred_np = field_pred[0]
+        field_gt_np = field_gt[0]
+        physical_rmse = float(np.sqrt(np.mean((field_pred_np - field_gt_np) ** 2)))
+        physical_mae = float(np.mean(np.abs(field_pred_np - field_gt_np)))
+
+        temporal_fft_pred = np.fft.fft(field_pred_np, axis=0)
+        temporal_fft_gt = np.fft.fft(field_gt_np, axis=0)
+        temporal_frmse = float(np.sqrt(np.mean((np.abs(temporal_fft_pred) - np.abs(temporal_fft_gt)) ** 2)))
+
+        spatial_frmse = None
         
         frames = field_pred.shape[1]  # T_CHUNK
         
@@ -379,7 +390,7 @@ def inference_demo(hp):
         ani = animation.FuncAnimation(fig, update, frames=range(frames), interval=80, blit=False)
 
         os.makedirs(SAVE_PATH, exist_ok=True)
-        base_name = "generated_trajectory_guided"
+        base_name = f"generated_trajectory_guided_index_{target_sim_idx}_sample_step_{num_steps}_rho_{rho}"
         ext = ".gif"
         counter = 0
         gif_path = os.path.join(SAVE_PATH, f"{base_name}{ext}")
@@ -435,22 +446,32 @@ def inference_demo(hp):
             from scipy.interpolate import griddata
             
             data0 = field_np[0] # [N, C]
+            data0_gt = field_gt_np[0] # [N, C]
             x_coords = coord[:, 0]
             y_coords = coord[:, 1]
             
             # 插值到 128x128 的规则网格
             grid_res = 128
             grid_x, grid_y = np.mgrid[min(x_coords):max(x_coords):complex(0, grid_res), min(y_coords):max(y_coords):complex(0, grid_res)]
+
+            spatial_channel_errors = []
             
             for c in range(num_channels):
                 values_sp_c = data0[:, c]
+                values_sp_gt_c = data0_gt[:, c]
                 grid_z = griddata((x_coords, y_coords), values_sp_c, (grid_x, grid_y), method='linear')
+                grid_z_gt = griddata((x_coords, y_coords), values_sp_gt_c, (grid_x, grid_y), method='linear')
                 grid_z[np.isnan(grid_z)] = 0.0 # 填补 nan
+                grid_z_gt[np.isnan(grid_z_gt)] = 0.0 # 填补 nan
                 
                 # 进行 2D FFT 并将其中心化
                 fft2_spatial = np.fft.fft2(grid_z)
+                fft2_spatial_gt = np.fft.fft2(grid_z_gt)
                 fft2_spatial_shift = np.fft.fftshift(fft2_spatial)
+                fft2_spatial_shift_gt = np.fft.fftshift(fft2_spatial_gt)
                 energy_spatial_2d = np.abs(fft2_spatial_shift)**2
+                energy_spatial_2d_gt = np.abs(fft2_spatial_shift_gt)**2
+                spatial_channel_errors.append(float(np.sqrt(np.mean((energy_spatial_2d - energy_spatial_2d_gt) ** 2))))
                 
                 # 进行径向平均(Radial average)获得各波数(wavenumber)频段的一维能量谱
                 center_x, center_y = grid_res//2, grid_res//2
@@ -471,6 +492,9 @@ def inference_demo(hp):
             ax_freq[1].set_title("Spatial Energy Spectrum (t=0)")
             ax_freq[1].grid(True, which="both", ls="--", alpha=0.5)
             ax_freq[1].legend()
+
+            if spatial_channel_errors:
+                spatial_frmse = float(np.mean(spatial_channel_errors))
         except Exception as e:
             print(f"Failed to compute spatial frequency: {e}")
             ax_freq[1].set_title("Spatial Spectral Failed")
@@ -480,6 +504,39 @@ def inference_demo(hp):
         plt.tight_layout()
         plt.savefig(freq_save_path, dpi=150)
         print(f"Saved frequency energy spectra to {freq_save_path}")
+
+        f_rmse_terms = [temporal_frmse]
+        if spatial_frmse is not None:
+            f_rmse_terms.append(spatial_frmse)
+        f_rmse = float(np.sqrt(np.mean(np.square(f_rmse_terms))))
+
+        print("\n" + "="*60)
+        print("ERROR METRICS COMPARISON")
+        print("="*60)
+        print("Global Error Metrics:")
+        print(f"  RMSE:  {physical_rmse:.6e}")
+        print(f"  MAE:   {physical_mae:.6e}")
+        print("Fourier Space Error:")
+        print(f"  Temporal fRMSE: {temporal_frmse:.6e}")
+        if spatial_frmse is not None:
+            print(f"  Spatial fRMSE:  {spatial_frmse:.6e}")
+        print(f"  fRMSE:          {f_rmse:.6e}")
+
+        metrics_path = os.path.join(SAVE_PATH, f"error_metrics_{target_sim_idx}_sample_step_{num_steps}_rho_{rho}.txt")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            f.write("ERROR METRICS COMPARISON\n")
+            f.write("=" * 60 + "\n\n")
+            f.write("Global Error Metrics:\n")
+            f.write(f"  RMSE:  {physical_rmse:.6e}\n")
+            f.write(f"  MAE:   {physical_mae:.6e}\n\n")
+            f.write("Fourier Space Error:\n")
+            f.write(f"  Temporal fRMSE: {temporal_frmse:.6e}\n")
+            if spatial_frmse is not None:
+                f.write(f"  Spatial fRMSE:  {spatial_frmse:.6e}\n")
+            f.write(f"  fRMSE:          {f_rmse:.6e}\n")
+
+        print(f"Metrics saved to {metrics_path}")
+        print("="*60 + "\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
